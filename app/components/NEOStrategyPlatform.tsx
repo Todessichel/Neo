@@ -121,7 +121,7 @@ const NEOStrategyPlatform = () => {
           <div className="p-4">
             <h2 className="text-xl font-bold mb-4">Strategy Document - NEO</h2>
             <h3 className="text-lg font-semibold mb-2">Vision</h3>
-            <p className="mb-4">To become the standard integrated platform that continuously aligns a company's strategic plan, financial projections, and operational metrics—guiding both startups and their investors towards sustainable, data-driven success.</p>
+            <p className="mb-4">To become the standard integrated platform that continuously aligns a companys strategic plan, financial projections, and operational metrics—guiding both startups and their investors towards sustainable, data-driven success.</p>
             
             <h3 className="text-lg font-semibold mb-2">Mission</h3>
             <p className="mb-4">NEO empowers startups and VCs to jointly create, track, and adapt cohesive strategies in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is dynamic, evidence-based, and future-resilient.</p>
@@ -232,12 +232,20 @@ const NEOStrategyPlatform = () => {
       setUser(userCredential);
       setShowLoginModal(false);
       loadProjects(userCredential.uid);
-    } catch (error: any) {
+      const userData: User = { uid: userCredential.uid, email: userCredential.email };
+      setUser(userData);
+      setShowLoginModal(false);
+      loadProjects(userData.uid);
+
+    } catch (error) {
+      // Properly type the error
+      const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
       console.error("Login error:", error);
-      setSuccessMessage(`Error: ${error.message}`);
+      setSuccessMessage(`Error: ${errorMessage}`);
     } finally {
       setIsLoading(false);
     }
+
   };
 
   const logoutUser = async () => {
