@@ -3,7 +3,7 @@
 import React from 'react';
 import Layout from '../components/layout/Layout';
 import DocumentViewer from '../components/documents/DocumentViewer';
-import ChatInterface from '../components/chat/ChatInterface';
+import ConnectedChatInterface from '../components/chat/ConnectedChatInterface';
 
 // Context Providers
 import { AuthProvider } from '../contexts/AuthContext';
@@ -33,7 +33,7 @@ export default function Home() {
                     
                     {/* Chat Interface (fixed at bottom) */}
                     <div className="mt-auto">
-                      <ChatInterface />
+                      <ConnectedChatInterface />
                     </div>
                   </div>
                 </Layout>

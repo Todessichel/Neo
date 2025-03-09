@@ -1,5 +1,7 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react';
+import { useContext } from 'react';
+import { DocumentContext, DocumentType } from '../contexts/DocumentContext';
 
 // Define types for our documents
 export type DocumentContent = {
@@ -29,9 +31,18 @@ type UseDocumentsReturn = {
   saveDocuments: () => void;
   loadDocuments: (projectId: string) => Promise<void>;
   inconsistencyCounts: Record<string, number>;
+  activeDocument?: DocumentType;
+  setActiveDocument?: React.Dispatch<React.SetStateAction<DocumentType>>;
+  lastSyncedAt?: Date | null;
+  isSyncing?: boolean;
+  hasDocuments?: boolean;
+  projectId?: string;
+  setProjectId?: React.Dispatch<React.SetStateAction<string>>;
+  projectList?: Array<any>;
 };
 
 export const useDocuments = (projectId?: string): UseDocumentsReturn => {
+  // Local state for documents and inconsistency counts
   const [documents, setDocuments] = useState<Record<string, Document>>({});
   const [inconsistencyCounts, setInconsistencyCounts] = useState<Record<string, number>>({
     'Canvas': 0,
@@ -39,12 +50,20 @@ export const useDocuments = (projectId?: string): UseDocumentsReturn => {
     'Financial Projection': 0,
     'OKRs': 0
   });
+  
+  // Get the document context
+  const context = useContext(DocumentContext);
 
   // Load documents from localStorage or API
   const loadDocuments = useCallback(async (pid: string) => {
     if (!pid || pid === 'default-project') return;
     
     try {
+      // If context is available, try to use its loadProjectDocuments function
+      if (context) {
+        await context.loadProjectDocuments(pid);
+      }
+      
       // For demo purposes, load from localStorage
       if (typeof window !== 'undefined') {
         const savedDocs = localStorage.getItem(`neoDocuments_${pid}`);
@@ -76,16 +95,10 @@ export const useDocuments = (projectId?: string): UseDocumentsReturn => {
           });
         }
       }
-      
-      // In a real app, you would fetch from an API:
-      // const response = await fetch(`/api/projects/${pid}/documents`);
-      // const data = await response.json();
-      // setDocuments(data);
-      
     } catch (error) {
       console.error("Error loading documents:", error);
     }
-  }, []);
+  }, [context]);
 
   // Load documents when projectId changes
   useEffect(() => {
@@ -108,11 +121,22 @@ export const useDocuments = (projectId?: string): UseDocumentsReturn => {
 
   // Get a specific document
   const getDocument = (type: string): Document | null => {
-    return documents[type] || null;
+    // First check local documents
+    if (documents[type]) {
+      return documents[type];
+    }
+    
+    // If not found and context is available, try to get from context
+    if (context && context.documents[type]) {
+      return context.documents[type] as Document;
+    }
+    
+    return null;
   };
 
   // Update a document
   const updateDocument = (type: string, content: DocumentContent) => {
+    // Update local state
     setDocuments(prev => ({
       ...prev,
       [type]: {
@@ -121,6 +145,15 @@ export const useDocuments = (projectId?: string): UseDocumentsReturn => {
         lastModified: new Date().toISOString()
       }
     }));
+    
+    // If context is available, try to update document in context as well
+    if (context) {
+      try {
+        context.updateDocument(type as DocumentType, content);
+      } catch (error) {
+        console.error(`Error updating document in context: ${error}`);
+      }
+    }
   };
 
   // Save documents to storage
@@ -129,20 +162,30 @@ export const useDocuments = (projectId?: string): UseDocumentsReturn => {
       localStorage.setItem(`neoDocuments_${projectId}`, JSON.stringify(documents));
     }
     
-    // In a real app:
-    // fetch(`/api/projects/${projectId}/documents`, {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify(documents)
-    // });
+    // If context is available and has a saveDocumentChanges function, we could use it here
+    // But we'd need to iterate through all documents and save each one
   };
 
+  // Combine local state with context values
   return {
+    // Local state values
     documents,
     getDocument,
     updateDocument,
     saveDocuments,
     loadDocuments,
-    inconsistencyCounts
+    inconsistencyCounts,
+    
+    // Context values if available
+    activeDocument: context?.activeDocument,
+    setActiveDocument: context?.setActiveDocument,
+    lastSyncedAt: context?.lastSyncedAt,
+    isSyncing: context?.isSyncing,
+    hasDocuments: context?.hasDocuments,
+    projectId: context?.projectId || projectId,
+    setProjectId: context?.setProjectId,
+    projectList: context?.projectList,
   };
 };
+
+export default useDocuments;

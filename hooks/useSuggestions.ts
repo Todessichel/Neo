@@ -1,8 +1,7 @@
+// hooks/useSuggestions.ts
 import { useContext } from 'react';
-import { SuggestionsContext } from '../contexts/SuggestionsContext';
-import { Suggestion } from '../types';
-import { Inconsistency } from '../types';
-import { DocumentType } from '../types';
+import { SuggestionsContext, Suggestion } from '../contexts/SuggestionsContext';
+import { DocumentType } from '../contexts/DocumentContext';
 
 /**
  * Custom hook for accessing and managing suggestions and inconsistencies
@@ -15,80 +14,71 @@ export const useSuggestions = () => {
     throw new Error('useSuggestions must be used within a SuggestionsProvider');
   }
   
+  // Extract the values from context
   const {
-    improvementSuggestions = {},
-    inconsistencies = {},
-    implementedSuggestions = [],
-    inconsistencyCount = {},
-    implementSuggestion,
-    recordImplementedSuggestion,
-    analyzeSuggestions,
-    analyzeInconsistencies,
-    resetImplementedSuggestions,
-    generateSuggestion
+    suggestions,
+    implementedSuggestions,
+    addSuggestion,
+    removeSuggestion,
+    markAsImplemented,
+    getSuggestionsForDocument,
+    clearAllSuggestions
   } = context;
   
   /**
-   * Gets improvement suggestions for a specific document type
+   * Gets suggestions for a specific document type
    * @param docType - Document type to get suggestions for
    * @returns Array of suggestions for the specified document
    */
   const getSuggestionsForDocument = (docType: DocumentType): Suggestion[] => {
-    // Ensure we always return an array, even if the document type doesn't exist
-    return Array.isArray(improvementSuggestions[docType]) 
-      ? improvementSuggestions[docType] 
-      : [];
+    return suggestions.filter(suggestion => suggestion.documentType === docType);
   };
   
   /**
    * Gets inconsistencies for a specific document type
-   * @param docType - Document type to get inconsistencies for
-   * @returns Array of inconsistencies for the specified document
+   * This is a placeholder until we update the context to include inconsistencies
    */
-  const getInconsistenciesForDocument = (docType: DocumentType): Inconsistency[] => {
-    // Ensure we always return an array, even if the document type doesn't exist
-    return Array.isArray(inconsistencies[docType]) 
-      ? inconsistencies[docType] 
-      : [];
+  const getInconsistenciesForDocument = (docType: DocumentType): any[] => {
+    // Return an empty array for now
+    return [];
   };
   
   /**
    * Checks if a suggestion has been implemented
    * @param suggestionId - ID of the suggestion to check
-   * @returns True if suggestion has been implemented, false otherwise
    */
   const isSuggestionImplemented = (suggestionId: string): boolean => {
-    // Ensure implementedSuggestions is an array before checking
-    return Array.isArray(implementedSuggestions) 
-      ? implementedSuggestions.includes(suggestionId) 
-      : false;
+    return implementedSuggestions.includes(suggestionId);
   };
   
   /**
-   * Gets the total count of all inconsistencies across documents
-   * @returns Total count of inconsistencies
+   * Implement a suggestion (placeholder function)
    */
-  const getTotalInconsistencyCount = (): number => {
-    // Ensure inconsistencyCount is an object before reducing
-    return Object.values(inconsistencyCount || {})
-      .reduce((acc, count) => acc + (Number(count) || 0), 0);
+  const implementSuggestion = async (suggestion: any): Promise<void> => {
+    markAsImplemented(suggestion.id);
+    // In a real app, this would update the document content
+  };
+  
+  // Generate placeholder inconsistency counts for UI display
+  const inconsistencyCount = {
+    'Canvas': 0,
+    'Strategy': 0,
+    'Financial Projection': 0,
+    'OKRs': 0
   };
   
   return {
-    improvementSuggestions,
-    inconsistencies,
+    suggestions,
     implementedSuggestions,
     inconsistencyCount,
     getSuggestionsForDocument,
     getInconsistenciesForDocument,
     isSuggestionImplemented,
-    getTotalInconsistencyCount,
     implementSuggestion,
-    recordImplementedSuggestion,
-    analyzeSuggestions,
-    analyzeInconsistencies,
-    resetImplementedSuggestions,
-    generateSuggestion
+    addSuggestion,
+    removeSuggestion,
+    markAsImplemented,
+    clearAllSuggestions
   };
 };
 

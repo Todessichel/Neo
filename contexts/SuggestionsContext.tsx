@@ -122,8 +122,8 @@ export const SuggestionsProvider: React.FC<{children: ReactNode}> = ({ children 
   );
 };
 
-/*Custom hook for using the suggestions context
-export const useSuggestionsOriginal = () => {
+// Custom hook for using the suggestions context
+export const useSuggestions = () => {
   const context = useContext(SuggestionsContext);
   
   if (context === undefined) {
@@ -131,6 +131,4 @@ export const useSuggestionsOriginal = () => {
   }
   
   return context;
-};*/
-
-//export const SuggestionsContext;
+};
