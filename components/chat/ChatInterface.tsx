@@ -33,10 +33,13 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
   // Get suggested responses based on the current state
   const getSuggestedResponses = () => {
+    // Ensure claudeResponses is an array and has a default value
+    const responses = claudeResponses || [];
+  
     // If no guided strategy or it's not active
     if (!guidedStrategyState || !guidedStrategyState.active) {
       // Default suggestions for a new chat
-      if (claudeResponses.length <= 1) {
+      if (responses.length <= 1) {
         return [
           {
             text: 'Help me create a strategy',
@@ -54,7 +57,9 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
       }
       
       // Contextual suggestions based on latest Claude response
-      const latestResponse = claudeResponses[claudeResponses.length - 1]?.response.toLowerCase() || '';
+      const latestResponse = responses.length > 0 
+        ? (responses[responses.length - 1]?.response || '').toLowerCase() 
+        : '';
       
       if (latestResponse.includes('guide') && latestResponse.includes('strategy')) {
         return [
@@ -134,20 +139,29 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
   return (
     <div className="p-4 pt-0">
-      {/* Claude AI Response Box */}
-      <div className="mx-4 mb-4 p-4 bg-purple-50 border border-purple-200 rounded shadow overflow-y-auto max-h-56">
-        <div className="space-y-4">
-          {claudeResponses.map((response, index) => (
-            <div key={response.id} className={index < claudeResponses.length - 1 ? 'mb-4 pb-4 border-b border-purple-100' : ''}>
+    {/* Claude AI Response Box */}
+    <div className="mx-4 mb-4 p-4 bg-purple-50 border border-purple-200 rounded shadow overflow-y-auto max-h-56">
+      <div className="space-y-4">
+        {Array.isArray(claudeResponses) && claudeResponses.length > 0 ? (
+          claudeResponses.map((response, index) => (
+            <div 
+              key={response.id || index} 
+              className={index < claudeResponses.length - 1 ? 'mb-4 pb-4 border-b border-purple-100' : ''}
+            >
               <ClaudeResponse 
                 response={response} 
                 isLatest={index === claudeResponses.length - 1} 
               />
             </div>
-          ))}
-          <div ref={messagesEndRef} />
-        </div>
+          ))
+        ) : (
+          <div className="text-gray-500 text-center py-4">
+            No responses yet. Start a conversation!
+          </div>
+        )}
+        <div ref={messagesEndRef} />
       </div>
+    </div>
       
       {/* Suggested Responses */}
       {suggestedResponses.length > 0 && (

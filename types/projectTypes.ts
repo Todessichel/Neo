@@ -6,3 +6,9 @@ export interface Project {
   created: string; // ISO date string
   description?: string; // Optional description
 }
+
+export type DocumentType = 
+  | 'Canvas' 
+  | 'Strategy' 
+  | 'Financial Projection' 
+  | 'OKRs';

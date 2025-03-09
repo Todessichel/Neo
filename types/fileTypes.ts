@@ -45,7 +45,6 @@ export interface FileSystemEntry {
 // Union type for all possible content formats
 export type FileContent = CsvContent | ExcelContent | WordContent | JsonContent | TextContent;
 
-
 // FileData interface that uses the FileContent type
 export interface FileData {
   path: string;

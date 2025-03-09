@@ -8,7 +8,13 @@ interface ClaudeResponseProps {
   isLatest?: boolean;
 }
 
-const ClaudeResponse: React.FC<ClaudeResponseProps> = ({ response, isLatest = false }) => {
+const ClaudeResponse: React.FC<ClaudeResponseProps> = ({ 
+  response, 
+  isLatest = false 
+}) => {
+  // Ensure response and response.response are valid
+  const responseText = response?.response || 'No response available';
+
   return (
     <div className={`${isLatest ? 'animate-fade-in' : ''}`}>
       <div className="flex items-center mb-2">
@@ -17,8 +23,8 @@ const ClaudeResponse: React.FC<ClaudeResponseProps> = ({ response, isLatest = fa
       </div>
       <div className="prose prose-sm max-w-none">
         {/* Format the response text with proper paragraphs */}
-        {response.response.split('\n\n').map((paragraph, index) => (
-          <p key={index}>
+        {responseText.split('\n\n').map((paragraph, paragraphIndex) => (
+          <p key={paragraphIndex}>
             {paragraph.split('\n').map((line, lineIndex) => (
               <React.Fragment key={lineIndex}>
                 {line}
