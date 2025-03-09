@@ -1,10 +1,19 @@
 import React, { createContext, useState, useEffect, ReactNode } from 'react';
+import { useAuth } from '../hooks/useAuth';
+import { useDocuments } from '../hooks/useDocuments';
 
 // Define the types for Claude response
 interface ClaudeResponse {
   id: number;
   response: string;
   timestamp?: Date;
+}
+
+// Define the guided strategy state
+interface GuidedStrategyState {
+  active: boolean;
+  step: number;
+  inputs: Record<number, string>;
 }
 
 // Define the context type
@@ -17,9 +26,13 @@ interface AIAssistantContextType {
   sendPromptToClaude: (prompt: string) => Promise<ClaudeResponse>;
   isProcessing: boolean;
   guidedStrategyActive: boolean;
+  guidedStrategyState: GuidedStrategyState;
+  setGuidedStrategyState: React.Dispatch<React.SetStateAction<GuidedStrategyState>>;
   startAIGuidedStrategy: () => void;
   endAIGuidedStrategy: () => void;
-  implementSuggestion: (suggestionId: string, section: string, action: string) => Promise<void>;
+  implementSuggestion: (suggestion: any) => Promise<void>;
+  recordImplementedSuggestion: (suggestionId: string, documentType: string) => Promise<void>;
+  createStrategyDocuments: (inputs: Record<number, string>) => void;
 }
 
 // Create the context with a default undefined value
@@ -31,6 +44,12 @@ interface AIAssistantProviderProps {
 }
 
 export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ children }) => {
+  // Get auth context
+  const auth = useAuth();
+  
+  // Get documents
+  const documents = useDocuments();
+  
   // State for Claude responses
   const [claudeResponses, setClaudeResponses] = useState<ClaudeResponse[]>([
     {
@@ -48,8 +67,29 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
   
   // State for guided strategy process
   const [guidedStrategyActive, setGuidedStrategyActive] = useState(false);
-  const [guidedStrategyStep, setGuidedStrategyStep] = useState(0);
-  const [guidedStrategyInputs, setGuidedStrategyInputs] = useState<Record<number, string>>({});
+  const [guidedStrategyState, setGuidedStrategyState] = useState<GuidedStrategyState>({
+    active: false,
+    step: 0,
+    inputs: {}
+  });
+
+  // State for implemented suggestions
+  const [implementedSuggestions, setImplementedSuggestions] = useState<string[]>([]);
+  
+  // Effect hook to check for empty documents and show guided strategy option
+  useEffect(() => {
+    const hasDocuments = documents?.hasDocuments;
+    
+    if (typeof window !== 'undefined' && hasDocuments === false && !guidedStrategyActive && claudeResponses.length <= 1) {
+      // Only show this once when the app first loads with no documents
+      const initialResponse = {
+        id: claudeResponses.length + 1,
+        response: "I notice you don't have any strategy documents yet. Would you like me to guide you through creating a complete strategy? I can help you develop a business model, strategic direction, OKRs, and financial projections."
+      };
+      
+      setClaudeResponses([...claudeResponses, initialResponse]);
+    }
+  }, [documents?.hasDocuments, guidedStrategyActive, claudeResponses]);
   
   /**
    * Handle chat submission
@@ -58,8 +98,17 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
     e.preventDefault();
     if (chatInput.trim() === '') return;
     
+    // Add user's message to the chat log
+    const userMessage = {
+      id: claudeResponses.length + 1,
+      response: chatInput,
+      timestamp: new Date()
+    };
+    
+    setClaudeResponses(prev => [...prev, userMessage]);
+    
     // If in guided strategy mode, handle differently
-    if (guidedStrategyActive) {
+    if (guidedStrategyState.active) {
       handleGuidedStrategyInput();
     } else {
       // Regular chat handling
@@ -90,17 +139,15 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
   const handleGuidedStrategyInput = () => {
     // Save user input for current step
     const updatedInputs = {
-      ...guidedStrategyInputs,
-      [guidedStrategyStep]: chatInput
+      ...guidedStrategyState.inputs,
+      [guidedStrategyState.step]: chatInput
     };
     
-    setGuidedStrategyInputs(updatedInputs);
-    
     // Determine next step and response based on current step
-    let nextStep = guidedStrategyStep + 1;
+    let nextStep = guidedStrategyState.step + 1;
     let nextResponse = "";
     
-    switch(guidedStrategyStep) {
+    switch(guidedStrategyState.step) {
       case 1: // Business Model Fundamentals
         nextResponse = "Great! Now let's talk about your strategic approach. Would you prefer a conservative approach prioritizing stability and consistent profitability, a moderate approach balancing growth with risk management, or an aggressive approach emphasizing faster growth with higher risk?";
         break;
@@ -114,7 +161,7 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
         // Final step - generate documents
         nextResponse = "Thank you! I'm now generating your complete set of strategy documents based on all your inputs. This includes an Enhanced Strategy Canvas, Strategy Document, OKRs, and Financial Projections - all aligned and coherent with each other.";
         
-        // Here you would actually generate the documents based on collected inputs
+        // Generate documents after delay
         setTimeout(() => {
           createStrategyDocuments(updatedInputs);
         }, 2000);
@@ -124,24 +171,22 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
     }
     
     // Update state
-    setGuidedStrategyStep(nextStep);
+    setGuidedStrategyState({
+      active: nextStep <= 4, // Only active for steps 1-4
+      step: nextStep,
+      inputs: updatedInputs
+    });
+    
+    setGuidedStrategyActive(nextStep <= 4);
     
     // Add Claude response
     const newResponse = {
-      id: claudeResponses.length + 1,
+      id: claudeResponses.length + 2, // +2 because we added user message
       response: nextResponse,
       timestamp: new Date()
     };
     
     setClaudeResponses(prev => [...prev, newResponse]);
-    
-    // If we've reached the end, finish the guided strategy process
-    if (nextStep > 4) {
-      setTimeout(() => {
-        setGuidedStrategyActive(false);
-        setGuidedStrategyStep(0);
-      }, 3000);
-    }
   };
   
   /**
@@ -206,8 +251,11 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
    */
   const startAIGuidedStrategy = () => {
     setGuidedStrategyActive(true);
-    setGuidedStrategyStep(1);
-    setGuidedStrategyInputs({});
+    setGuidedStrategyState({
+      active: true,
+      step: 1,
+      inputs: {}
+    });
     
     // Add initial Claude response
     const welcomeResponse = {
@@ -224,8 +272,11 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
    */
   const endAIGuidedStrategy = () => {
     setGuidedStrategyActive(false);
-    setGuidedStrategyStep(0);
-    setGuidedStrategyInputs({});
+    setGuidedStrategyState({
+      active: false,
+      step: 0,
+      inputs: {}
+    });
   };
   
   /**
@@ -236,7 +287,209 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
     console.log("Creating strategy documents from inputs:", inputs);
     
     // In a real app, this would actually create documents
-    // For now, just log that we would create them
+    // For now, just generate simple documents
+    
+    // Process inputs and create documents
+    console.log("Creating strategy documents from inputs:", inputs);
+    
+    // Sample Strategy Document Content
+    const strategyContent = {
+      html: `
+        <div class="p-4">
+          <h2 class="text-xl font-bold mb-4">Strategy Document - Generated</h2>
+          <h3 class="text-lg font-semibold mb-2">Vision</h3>
+          <p class="mb-4">Custom vision based on user inputs...</p>
+          
+          <h3 class="text-lg font-semibold mb-2">Mission</h3>
+          <p class="mb-4">Custom mission based on user inputs...</p>
+          
+          <h3 class="text-lg font-semibold mb-2">Business Goals</h3>
+          <ul class="list-disc pl-5 mb-4">
+            <li>Goal 1 based on user inputs</li>
+            <li>Goal 2 based on user inputs</li>
+            <li>Goal 3 based on user inputs</li>
+          </ul>
+        </div>
+      `,
+      raw: {
+        vision: "Custom vision based on user inputs...",
+        mission: "Custom mission based on user inputs...",
+        businessGoals: [
+          "Goal 1 based on user inputs",
+          "Goal 2 based on user inputs",
+          "Goal 3 based on user inputs"
+        ]
+      }
+    };
+    
+    // Sample OKR Content
+    const okrContent = {
+      html: `
+        <div class="p-4">
+          <h2 class="text-xl font-bold mb-4">OKRs - Generated</h2>
+          
+          <div class="mb-4">
+            <h3 class="text-lg font-semibold mb-2">Objective 1: Generated from user input</h3>
+            <p class="italic mb-2">Rationale: Based on strategic direction from step 2.</p>
+            <ul class="list-disc pl-5">
+              <li>KR1: Specific metric based on user input</li>
+              <li>KR2: Specific metric based on user input</li>
+              <li>KR3: Specific metric based on user input</li>
+            </ul>
+          </div>
+          
+          <div class="mb-4">
+            <h3 class="text-lg font-semibold mb-2">Objective 2: Generated from user input</h3>
+            <p class="italic mb-2">Rationale: Based on financial goals from step 4.</p>
+            <ul class="list-disc pl-5">
+              <li>KR1: Specific metric based on user input</li>
+              <li>KR2: Specific metric based on user input</li>
+              <li>KR3: Specific metric based on user input</li>
+            </ul>
+          </div>
+        </div>
+      `,
+      raw: {
+        objectives: [
+          {
+            title: "Generated from user input",
+            rationale: "Based on strategic direction from step 2.",
+            keyResults: [
+              "Specific metric based on user input",
+              "Specific metric based on user input",
+              "Specific metric based on user input"
+            ]
+          },
+          {
+            title: "Generated from user input",
+            rationale: "Based on financial goals from step 4.",
+            keyResults: [
+              "Specific metric based on user input",
+              "Specific metric based on user input",
+              "Specific metric based on user input"
+            ]
+          }
+        ]
+      }
+    };
+    
+    // Sample Canvas Content
+    const canvasContent = {
+      html: `
+        <div class="p-4">
+          <h2 class="text-xl font-bold mb-4">Enhanced Strategy Canvas - Generated</h2>
+          <h3 class="text-lg font-semibold mb-2">Business Model (Value Creation & Economic Viability)</h3>
+          <div class="mb-4">
+            <h4 class="font-medium">Customer Segments</h4>
+            <ul class="list-disc pl-5">
+              <li>Segment 1 based on user input from step 1</li>
+              <li>Segment 2 based on user input from step 1</li>
+            </ul>
+          </div>
+          <div class="mb-4">
+            <h4 class="font-medium">Value Proposition</h4>
+            <ul class="list-disc pl-5">
+              <li>Value proposition based on user input from step 1</li>
+              <li>Additional value proposition based on analysis</li>
+            </ul>
+          </div>
+          <div class="mb-4">
+            <h4 class="font-medium">Revenue Model</h4>
+            <ul class="list-disc pl-5">
+              <li>Revenue stream based on user input from step 4</li>
+              <li>Additional revenue opportunities identified</li>
+            </ul>
+          </div>
+        </div>
+      `,
+      raw: {
+        businessModel: {
+          customerSegments: [
+            "Segment 1 based on user input from step 1",
+            "Segment 2 based on user input from step 1"
+          ],
+          valueProposition: [
+            "Value proposition based on user input from step 1",
+            "Additional value proposition based on analysis"
+          ],
+          revenueModel: [
+            "Revenue stream based on user input from step 4",
+            "Additional revenue opportunities identified"
+          ]
+        }
+      }
+    };
+    
+    // Sample Financial Projection
+    const financialContent = {
+      html: `
+        <div class="p-4">
+          <h2 class="text-xl font-bold mb-4">Financial Projection - Generated</h2>
+          <div class="mb-4">
+            <h3 class="text-lg font-semibold mb-2">Revenue Forecasts</h3>
+            <p>Based on financial goals from step 4 inputs</p>
+            <table class="min-w-full border mt-2">
+              <thead>
+                <tr>
+                  <th class="border p-2">Scenario</th>
+                  <th class="border p-2">Year 1</th>
+                  <th class="border p-2">Year 2</th>
+                  <th class="border p-2">Year 3</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="border p-2">Optimistic</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                </tr>
+                <tr>
+                  <td class="border p-2">Expected</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                </tr>
+                <tr>
+                  <td class="border p-2">Conservative</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                  <td class="border p-2">€XXX,XXX</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="mb-4">
+            <h3 class="text-lg font-semibold mb-2">Cost Structure</h3>
+            <p>Derived from business model in step 1</p>
+          </div>
+        </div>
+      `,
+      raw: {
+        revenue: {
+          scenarios: {
+            optimistic: { year1: 0, year2: 0, year3: 0 },
+            expected: { year1: 0, year2: 0, year3: 0 },
+            conservative: { year1: 0, year2: 0, year3: 0 }
+          }
+        },
+        costs: {
+          structure: "Derived from business model in step 1"
+        }
+      }
+    };
+    
+    // Try to update documents through context
+    try {
+      if (documents?.updateDocument) {
+        documents.updateDocument('Strategy', strategyContent);
+        documents.updateDocument('OKRs', okrContent);
+        documents.updateDocument('Canvas', canvasContent);
+        documents.updateDocument('Financial Projection', financialContent);
+      }
+    } catch (error) {
+      console.error("Error updating documents:", error);
+    }
     
     // Add confirmation response
     const completionResponse = {
@@ -252,26 +505,36 @@ export const AIAssistantProvider: React.FC<AIAssistantProviderProps> = ({ childr
    * Implement a suggestion
    */
   const implementSuggestion = async (
-    suggestionId: string, 
-    section: string, 
-    action: string
+    suggestion: {
+      id: string, 
+      text: string, 
+      implementationDetails: {
+        section: string, 
+        action: string
+      }
+    }
   ): Promise<void> => {
     setIsProcessing(true);
     
     try {
+      const { section, action } = suggestion.implementationDetails;
+      
       // Create standardized prompt for Claude
       const standardizedPrompt = `
 INSTRUCTION: Please implement the following change to maintain strategic coherence across documents.
 
 DOCUMENT TO MODIFY: ${section}
 ACTION REQUIRED: ${action}
-CONTEXT: This change is needed to improve alignment between documents
+CONTEXT: This change is needed to ${suggestion.text.toLowerCase()}
 
 Please implement this change while maintaining alignment with all other strategic documents.
 `;
 
-      // Send prompt to Claude
+      // Send prompt to Claude (simulated)
       await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      // Record the suggestion as implemented
+      setImplementedSuggestions(prev => [...prev, suggestion.id]);
       
       // Add Claude's response
       const newResponse = {
@@ -282,11 +545,42 @@ Please implement this change while maintaining alignment with all other strategi
       
       setClaudeResponses(prev => [...prev, newResponse]);
       
+      // Also record in database if user is logged in
+      await recordImplementedSuggestion(suggestion.id, section);
+      
       setIsProcessing(false);
     } catch (error) {
       setIsProcessing(false);
       console.error('Error implementing suggestion:', error);
       throw error;
+    }
+  };
+  
+  /**
+   * Record an implemented suggestion in the database
+   */
+  const recordImplementedSuggestion = async (suggestionId: string, documentType: string): Promise<void> => {
+    if (!auth?.user || !auth?.db) return;
+    
+    try {
+      // Map UI document names to DB document types
+      const docTypeMap: {[key: string]: string} = {
+        'Canvas': 'canvas',
+        'Strategy': 'strategy',
+        'Financial Projection': 'financial',
+        'OKRs': 'okrs'
+      };
+      
+      const dbType = docTypeMap[documentType];
+      if (!dbType) return;
+      
+      // Get projectId (this would come from your documents context in real app)
+      const projectId = documents?.projectId || 'default-project';
+      if (projectId === 'default-project') return;
+      
+      await auth.db.recordImplementedSuggestion(projectId, dbType, suggestionId);
+    } catch (error) {
+      console.error("Error recording implemented suggestion:", error);
     }
   };
   
@@ -300,9 +594,13 @@ Please implement this change while maintaining alignment with all other strategi
     sendPromptToClaude,
     isProcessing,
     guidedStrategyActive,
+    guidedStrategyState,
+    setGuidedStrategyState,
     startAIGuidedStrategy,
     endAIGuidedStrategy,
-    implementSuggestion
+    implementSuggestion,
+    recordImplementedSuggestion,
+    createStrategyDocuments
   };
   
   return (
@@ -310,4 +608,13 @@ Please implement this change while maintaining alignment with all other strategi
       {children}
     </AIAssistantContext.Provider>
   );
+};
+
+// Custom hook for using the AI Assistant context
+export const useAIAssistant = () => {
+  const context = React.useContext(AIAssistantContext);
+  if (context === undefined) {
+    throw new Error('useAIAssistant must be used within an AIAssistantProvider');
+  }
+  return context;
 };

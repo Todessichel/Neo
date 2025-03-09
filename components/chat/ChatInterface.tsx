@@ -1,5 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ClaudeResponse from './ClaudeResponse';
+import ChatContainer from './ChatContainer';
+
 
 interface ChatInterfaceProps {
   claudeResponses: Array<{ id: number; response: string }>;
