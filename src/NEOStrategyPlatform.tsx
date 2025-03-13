@@ -1,12 +1,18 @@
 'use client'
-import React, { useState, useEffect, JSX } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import LoginModal from './components/modals/LoginModal';
 import SettingsModal from './components/modals/SettingsModal';
 import FileManagerModal from './components/modals/FileManagerModal';
 import IntegrationModal from './components/modals/IntegrationModal';
 import { DatabaseService } from './services/DatabaseService';
-import { User } from './types/userTypes';
-import { Project } from './types/projectTypes';
+import type { User } from './types/userTypes';
+import type { Project } from './types/projectTypes';
+import { FileSetupModal } from './components/modals/FileSetupModal';
+import { FileLocation } from './types/fileTypes';
+import { FileService } from './services/FileService';
+import { FileSystemService, FileData } from './services/FileSystemService';
+import { marked } from 'marked';
+import { CheckIcon, XMarkIcon } from '@heroicons/react/24/solid';
 
 
 // Note: In a real app, you'd need to install these packages
@@ -41,53 +47,97 @@ type ClaudeResponse = {
   };
 };
 
-// Inconsistencies based on active document
-const inconsistencies: {[key: string]: Array<{id: string, text: string, implementationDetails: {section: string, action: string}}> } = {
-  Strategy: [
-    {
-      id: 'inconsistency-strategy-1',
-      text: 'Strategy mentions 90% customer satisfaction target, but no corresponding KR exists in OKRs',
-      implementationDetails: {
-        section: 'OKRs',
-        action: 'Add customer satisfaction KR to align with Strategy'
+function hasSuggestion(response: ClaudeResponse): response is ClaudeResponse & { suggestion: NonNullable<ClaudeResponse['suggestion']> } {
+  return response.suggestion !== undefined;
+}
+
+// Move inconsistencies before state initialization
+const useInconsistencies = () => {
+  return React.useMemo(() => ({
+    Strategy: [
+      {
+        id: 'inconsistency-strategy-1',
+        text: 'Strategy mentions 90% customer satisfaction target, but no corresponding KR exists in OKRs',
+        implementationDetails: {
+          section: 'OKRs',
+          action: 'Add customer satisfaction KR to align with Strategy'
+        }
       }
-    }
-  ],
-  OKRs: [
-    {
-      id: 'inconsistency-okr-1',
-      text: 'OKRs target 300 subscribers, but specific acquisition strategies are undefined in Canvas',
-      implementationDetails: {
-        section: 'Canvas',
-        action: 'Add acquisition strategies to align with OKR targets'
+    ],
+    OKRs: [
+      {
+        id: 'inconsistency-okr-1',
+        text: 'OKRs target 300 subscribers, but specific acquisition strategies are undefined in Canvas',
+        implementationDetails: {
+          section: 'Canvas',
+          action: 'Add acquisition strategies to align with OKR targets'
+        }
       }
-    }
-  ],
-  'Financial Projection': [
-    {
-      id: 'inconsistency-finance-1',
-      text: 'Financial projection shows €8,300 MRR but may be unrealistic given the subscription tier distribution',
-      implementationDetails: {
-        section: 'Financial Projection',
-        action: 'Adjust MRR target or subscription distribution'
+    ],
+    'Financial Projection': [
+      {
+        id: 'inconsistency-finance-1',
+        text: 'Financial projection shows €8,300 MRR but may be unrealistic given the subscription tier distribution',
+        implementationDetails: {
+          section: 'Financial Projection',
+          action: 'Adjust MRR target or subscription distribution'
+        }
       }
-    }
-  ],
-  Canvas: [
-    {
-      id: 'inconsistency-canvas-1',
-      text: 'Canvas lacks channel strategy but OKRs assume specific acquisition metrics',
-      implementationDetails: {
-        section: 'Canvas',
-        action: 'Add channels section to Canvas'
+    ],
+    Canvas: [
+      {
+        id: 'inconsistency-canvas-1',
+        text: 'Canvas lacks channel strategy but OKRs assume specific acquisition metrics',
+        implementationDetails: {
+          section: 'Canvas',
+          action: 'Add channels section to Canvas'
+        }
       }
-    }
-  ]
+    ]
+  }), []);
 };
 
-const NEOStrategyPlatform = () => {
+interface DocumentData {
+  content?: {
+    html?: string;
+    raw?: any;
+  };
+  inconsistencies?: Array<{
+    id: string;
+    type: string;
+    description: string;
+  }>;
+}
+
+interface DocumentContent {
+  html: string;
+  raw: any;
+}
+
+// Add type definition for inconsistency
+interface Inconsistency {
+  id: string;
+  text: string;
+  implementationDetails: {
+    section: string;
+    action: string;
+  };
+}
+
+const NEOStrategyPlatform = (): JSX.Element => {
   // Client-side rendering check
   const [isClient, setIsClient] = useState(false);
+  
+  // Get inconsistencies
+  const inconsistencies = useInconsistencies();
+  
+  // Initialize inconsistency count based on actual inconsistencies
+  const [inconsistencyCount, setInconsistencyCount] = useState<Record<DocumentType, number>>({
+    'Canvas': 0,
+    'Strategy': 0,
+    'Financial Projection': 0,
+    'OKRs': 0
+  });
   
   // Auth state
   const [user, setUser] = useState<User | null>(null);
@@ -106,6 +156,7 @@ const NEOStrategyPlatform = () => {
   const [chatInput, setChatInput] = useState('');
   const [claudeResponses, setClaudeResponses] = useState<ClaudeResponse[]>([]);
   const [implementedSuggestions, setImplementedSuggestions] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [claudePrompt, setClaudePrompt] = useState<string | null>(null);
   const [promptStage, setPromptStage] = useState('idle'); // idle, pending, completed
@@ -125,24 +176,857 @@ const NEOStrategyPlatform = () => {
   const [storageDirectory, setStorageDirectory] = useState('');
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showFileManagerModal, setShowFileManagerModal] = useState(false);
+  const [modalRefreshKey, setModalRefreshKey] = useState(0); // Add refresh key for modals
   
-  // Initialize inconsistency count based on actual inconsistencies
-  const [inconsistencyCount, setInconsistencyCount] = useState<Record<DocumentType, number>>({
-    'Canvas': inconsistencies['Canvas']?.length || 0,
-    'Strategy': inconsistencies['Strategy']?.length || 0,
-    'Financial Projection': inconsistencies['Financial Projection']?.length || 0,
-    'OKRs': inconsistencies['OKRs']?.length || 0
+  // Add state for document assignments
+  const [documentAssignments, setDocumentAssignments] = useState<Record<DocumentType, string>>({
+    'Canvas': '',
+    'Strategy': '',
+    'Financial Projection': '',
+    'OKRs': ''
   });
+  
+  // Add new state for handling warning suggestions
+  const [selectedWarning, setSelectedWarning] = useState<{
+    docType: DocumentType;
+    inconsistency: Inconsistency;
+  } | null>(null);
+  
+  // Initialize client-side state
+  useEffect(() => {
+    setIsClient(true);
+    
+    // Load document assignments from localStorage
+    const savedAssignments = localStorage.getItem('neoDocumentAssignments');
+    if (savedAssignments) {
+      const parsedAssignments = JSON.parse(savedAssignments) as Record<DocumentType, string>;
+      setDocumentAssignments(parsedAssignments);
+      setHasDocuments(Object.values(parsedAssignments).some(path => path !== ''));
+    }
+    
+    // Initialize guided strategy state
+    const savedGuidedState = localStorage.getItem('neoGuidedStrategy');
+    if (savedGuidedState) {
+      setGuidedStrategyState(JSON.parse(savedGuidedState));
+    }
+    
+    // Initialize Claude responses
+    const savedResponses = localStorage.getItem('neoClaudeResponses');
+    if (savedResponses) {
+      setClaudeResponses(JSON.parse(savedResponses));
+    }
+  }, []);
+  
+  // Debug function to log the state of the file system
+  const logFileSystemState = () => {
+    if (!isClient) return;
+    
+    const fileSystem = JSON.parse(localStorage.getItem('neoFileSystem') || '{}');
+    const cleanStorageDir = storageDirectory ? storageDirectory.replace(/^\/+|\/+$/g, '') : '';
+    
+    console.log('DEBUG - Current storage directory:', storageDirectory);
+    console.log('DEBUG - Cleaned storage directory:', cleanStorageDir);
+    console.log('DEBUG - All files in localStorage:', Object.keys(fileSystem));
+    
+    const filesInCurrentDir = Object.keys(fileSystem).filter(path => {
+      const cleanPath = path.replace(/^\/+|\/+$/g, '');
+      
+      if (!cleanStorageDir) {
+        return !cleanPath.includes('/');
+      }
+      
+      return cleanPath.startsWith(cleanStorageDir + '/') && 
+        !cleanPath.slice(cleanStorageDir.length + 1).includes('/');
+    });
+    
+    console.log('DEBUG - Files in current directory:', filesInCurrentDir);
+    console.log('DEBUG - File count in current directory:', filesInCurrentDir.length);
+  };
 
   // Initialize db as state
   const [db, setDb] = useState<DatabaseService | null>(null);
   
   // Initialize default document content
   const [documentContent, setDocumentContent] = useState<Record<DocumentType, JSX.Element>>({
-    Canvas: <div className="p-4">Loading Canvas...</div>,
-    Strategy: <div className="p-4">Loading Strategy...</div>,
-    'Financial Projection': <div className="p-4">Loading Financial Projection...</div>,
-    OKRs: <div className="p-4">Loading OKRs...</div>
+    Canvas: (
+      <div className="p-4">
+        <h2 className="text-xl font-bold mb-4">NEO - Enhanced Strategy Canvas</h2>
+        <div className="prose prose-sm max-w-none">
+          <h3 className="text-lg font-semibold mb-2">Section 1: Business Model (Value Creation & Economic Viability)</h3>
+          
+          <h4 className="font-medium">1. Customer Segments</h4>
+          <div className="mb-4">
+            <p className="font-medium">Early‐ to Growth‐Stage Startups</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Need integrated strategy + financial modeling</li>
+              <li>Seek quick insights on product–market fit and pivot timing</li>
+              <li>Comfortable with AI and new tech tools</li>
+            </ul>
+
+            <p className="font-medium">SMEs / Mittelstand</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Require advanced scenario analysis (e.g., cost optimization)</li>
+              <li>Traditional but under competitive + cost pressures</li>
+              <li>Interested in partial automation of strategic planning</li>
+            </ul>
+
+            <p className="font-medium">Boutique Consultancies</p>
+            <ul className="list-disc pl-5 mb-4">
+              <li>Potential to white‐label or embed NEO in client engagements</li>
+              <li>Value add: Automated strategy assessment + robust financial modules</li>
+            </ul>
+          </div>
+
+          <h4 className="font-medium">2. Value Proposition</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Integrated AI for Strategy, Systems Thinking & Finance: Single tool unifying strategic planning, system dynamics, and real‐time financial projections.</li>
+            <li>Minimal Effort, High Impact: NEO's interface and guided Q&A help non‐technical teams quickly produce consistent strategies + cash flow forecasts.</li>
+            <li>High‐Touch + Self‐Serve: Subscription tiers from Basic to Enterprise, plus optional short-run pilot packages for immediate lumpsum value + advanced support.</li>
+          </ul>
+
+          <h4 className="font-medium">3. Revenue Model</h4>
+          <div className="mb-4">
+            <p className="font-medium">Subscription Tiers</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Basic @ €49/mo: Core strategy interface + essential AI prompts</li>
+              <li>Pro @ €99/mo: Deeper scenario planning, advanced analytics, partial priority support</li>
+              <li>Enterprise @ €299/mo: Full feature set, premium support, potential customization</li>
+            </ul>
+
+            <p className="font-medium">Pilot Engagements & Consulting</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Short-run "Strategy Accelerator" packages at €5–10k each</li>
+              <li>Retainer options for ongoing advisory or extended support</li>
+            </ul>
+
+            <p className="italic">Goal: Combine recurring subscription MRR (~€8.3k needed by Month 12) with pilot deals to surpass €100k total revenue in Year 1.</p>
+          </div>
+
+          <h4 className="font-medium">4. Cost Structure & Resource Allocation</h4>
+          <div className="mb-4">
+            <p className="font-medium">Fixed / Operational Costs:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Tech stack (infrastructure, software subscriptions), marketing campaigns, some development resources (potential freelancers)</li>
+            </ul>
+
+            <p className="font-medium">Variable Costs:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Travel for in‐person pilot engagements, potential commissions for referral partnerships</li>
+            </ul>
+
+            <p className="italic">Emphasis: Lean operations but allocate enough to high‐ROI marketing (LinkedIn, partnership events) to secure pilot deals quickly.</p>
+          </div>
+
+          <h4 className="font-medium">5. Channels & Go‐to‐Market Strategy</h4>
+          <div className="mb-4">
+            <p className="font-medium">Digital Presence</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Targeted LinkedIn Ads for startup founders / scale‐up CEOs</li>
+              <li>Bi‐weekly NEO Live Demo Webinars (drive immediate signups or pilot interest)</li>
+              <li>Thought leadership content (blog posts, short LinkedIn articles) focusing on synergy of AI + strategic finance</li>
+            </ul>
+
+            <p className="font-medium">Partnerships</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>2–3 startup accelerators or VC networks with special deals for portfolio companies</li>
+              <li>Potential collaborations with boutique consulting firms</li>
+            </ul>
+
+            <p className="font-medium">Direct Sales</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Founder‐led outbound to ~20–30 leads monthly, focusing on Enterprise or pilot deals</li>
+              <li>Fast follow‐ups on inbound leads from events / content marketing</li>
+            </ul>
+          </div>
+
+          <h4 className="font-medium">6. Key Activities</h4>
+          <div className="mb-4">
+            <p className="font-medium">Product Development:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Maintain monthly iteration cycles; implement top user requests for advanced analytics / financial modeling</li>
+            </ul>
+
+            <p className="font-medium">Marketing & Sales:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Execute 2–3 targeted campaigns per quarter</li>
+              <li>Conduct live demos, manage pilot engagements, sign annual Enterprise deals</li>
+            </ul>
+
+            <p className="font-medium">Customer Success:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Onboarding flows for Basic, Pro, Enterprise</li>
+              <li>Priority support + best‐practice sharing for pilot engagement clients</li>
+            </ul>
+          </div>
+
+          <h4 className="font-medium">7. Key Partnerships & Ecosystem</h4>
+          <div className="mb-6">
+            <p className="font-medium">Startup Incubators / Accelerators</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Bulk onboarding of early‐stage startups at Basic or Pro tiers</li>
+              <li>Revenue share or discount codes in exchange for co‐branding</li>
+            </ul>
+
+            <p className="font-medium">SME Networks & Trade Organizations</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Introductory webcasts explaining AI‐driven strategy for midsize businesses</li>
+            </ul>
+
+            <p className="font-medium">Consulting & Tech Alliances</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Partnerships with complementary SaaS (e.g., project management or CRM tools)</li>
+              <li>Cross‐sell packages targeting companies wanting an end‐to‐end digital transformation</li>
+            </ul>
+          </div>
+
+          <h3 className="text-lg font-semibold mb-2">Section 2: Strategy (Competitive Positioning & Strategic Choices)</h3>
+          
+          <h4 className="font-medium">8. Market Definition & Competitive Landscape</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>AI‐Driven Strategy Tools: Growing but often siloed—few unify strategy, finance & system dynamics in one interface.</li>
+            <li>Generic Financial Projection Platforms: Excel add‐ons, basic CFO tools lacking deep strategic or AI support.</li>
+            <li>Traditional Consultancies: High cost, manual methods. Can't easily scale for smaller clients.</li>
+          </ul>
+
+          <h4 className="font-medium">9. Where to Play (Strategic Positioning)</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Focus on Founders + Growth‐Stage Firms: They value an AI tool that can quickly assess new revenue models, cost structures, break‐even points, pivot timing.</li>
+            <li>SMEs Seeking Competitive Modernization: Emphasize how NEO's advanced forecasting and scenario planning addresses cost pressures and digital transformation demands.</li>
+          </ul>
+
+          <h4 className="font-medium">10. How to Win (Competitive Advantage & Differentiation)</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Advanced AI: Specialized training in systems thinking, strategy frameworks, and integrated financial modeling.</li>
+            <li>Immediate ROI: Clear outcomes from pilot engagements; pay‐once for a "Strategy Accelerator," keep subscription for ongoing iteration.</li>
+            <li>Ease + Depth: Straightforward interface, but robust under the hood for advanced analytics.</li>
+          </ul>
+
+          <h4 className="font-medium">11. Trade‐offs & Focus Areas</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Prioritize Pilots Over General Low‐Tier Volume: Must close 8–10 higher‐value deals to ensure hitting €100k.</li>
+            <li>Limit Over‐Customization: Avoid building excessive features that only serve niche demands. Keep product agile but consistent.</li>
+          </ul>
+
+          <h4 className="font-medium">12. Key Capabilities & Organizational Strengths</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>AI Expertise: Efficiently convert large strategic / financial data sets into actionable insights.</li>
+            <li>Systems Thinking: Holistic approach ensures clients see beyond linear "input–output," fosters deeper scenario planning.</li>
+            <li>Sales + Consulting Experience: Ability to quickly build trust, pitch to top‐tier clients or accelerator cohorts.</li>
+          </ul>
+
+          <h4 className="font-medium">13. Business Model Scalability & Growth Strategy</h4>
+          <div className="mb-6">
+            <p className="font-medium">Year 1</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>€100k target via combined subscription + pilot revenues.</li>
+              <li>300 paying subscribers, with 40% on Pro or Enterprise.</li>
+            </ul>
+
+            <p className="font-medium">Year 2–3</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Expand marketing channels, formal reseller partnerships.</li>
+              <li>Potential new modules (sector‐specific expansions, deeper ESG or supply chain risk analyses).</li>
+            </ul>
+          </div>
+
+          <h3 className="text-lg font-semibold mb-2">Section 3: Systems Thinking (Resilience & Adaptability Mechanisms)</h3>
+          
+          <h4 className="font-medium">14. External Forces & Market Dynamics</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>AI Regulation & Data Privacy: Watch for shifts that might affect how we develop or handle financial data.</li>
+            <li>Economic Climate: If funding slows, pivot messaging to cost‐saving, ROI metrics.</li>
+            <li>Competitive Imitation: Expect new entrants. Keep distinctive synergy of strategy + finance + systems approach.</li>
+          </ul>
+
+          <h4 className="font-medium">15. Risk Factors & Uncertainty Mapping</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Pricing Resistance: Some early‐stage founders might balk at €299 for Enterprise. Mitigate via pilot ROI demos.</li>
+            <li>Resource Overextension: Founder's time is limited. Enlist help for marketing or user support if signups surge.</li>
+            <li>Dependence on Partnerships: If an accelerator partnership underdelivers on signups, pivot quickly to direct outreach.</li>
+          </ul>
+
+          <h4 className="font-medium">16. Leading Indicators & Early Warning Signals</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Pilot Deal Pipeline: If fewer than 2 pilot deals close in the first quarter, intensify direct outreach / discount promos.</li>
+            <li>Churn Rate: Spikes in monthly cancellations among Pro or Enterprise signups indicate product or onboarding issues.</li>
+            <li>Lead Volume from Partnerships: Track signups from each referral link or event; course‐correct if conversions lag.</li>
+          </ul>
+
+          <h4 className="font-medium">17. Feedback Loops & Learning Mechanisms</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>User Feedback Cycle: Gather monthly feedback from paying users. Rapidly implement top requests for scenario planning or advanced analytics.</li>
+            <li>Pilot "Success Stories": Each short‐run engagement must end with a postmortem to refine NEO's frameworks.</li>
+            <li>Quarterly Strategy Review: Evaluate go‐to‐market results, pivot marketing channels or pilot pricing if short of revenue targets.</li>
+          </ul>
+
+          <h4 className="font-medium">18. Scenario Planning & Contingency Strategies</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Best Case: Quick pilot wins, user base grows to 300+ at healthy Pro/Enterprise ratio, well over €100k.</li>
+            <li>Moderate: Slower pilot traction, must double down on partner channels, maybe lower initial pilot price to fill the pipeline.</li>
+            <li>Worst Case: Very low signups at new subscription levels, forcing promotional deals or pivot to a broader consulting focus.</li>
+          </ul>
+
+          <h4 className="font-medium">19. Long‐Term Sustainability & Competitive Evolution</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Continuous Innovation: Keep AI features relevant. Expand sectors (manufacturing, SaaS, healthcare).</li>
+            <li>Scaling Freedoms: Once subscription MRR is stable, invest in expansions (APIs, advanced reporting modules).</li>
+            <li>Global Market Reach: Localize the tool (languages, local compliance) if growth potential emerges internationally.</li>
+          </ul>
+        </div>
+      </div>
+    ),
+    Strategy: (
+      <div className="p-4">
+        <h2 className="text-xl font-bold mb-4">Strategy Document for NEO</h2>
+        <div className="prose prose-sm max-w-none">
+          <h3 className="text-lg font-semibold mb-2">1. Strategic Narrative (Core Story)</h3>
+          <p>NEO is our next-generation AI tool engineered to revolutionize the way businesses develop and execute strategy. By harnessing advanced machine learning and systems analysis, NEO delivers real-time, actionable insights that empower users to align strategic planning with financial performance. NEO not only automates the strategic design process—integrating customer insights, operational data, and financial projections—but also provides dynamic feedback loops and scenario planning capabilities that adapt to market changes. Its mission is to transform complex strategic challenges into clear, data-driven action plans with minimal user effort.</p>
+          
+          <h4 className="font-medium mt-4">Where We Are Now</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Many startups and growing businesses create one‐off strategic documents that quickly become outdated, fail to link to financial projections, and do not adapt to changing market needs.</li>
+            <li>Venture Capital (VC) firms seek consistent, up‐to‐date insight into their portfolio companies but often rely on manual reporting.</li>
+            <li>Tools exist for strategy, for financial projections, and for OKR monitoring — but they rarely stay in sync.</li>
+          </ul>
+
+          <h4 className="font-medium">Where We Want to Go</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>NEO becomes the go-to platform for continuous strategic alignment: diagnosing challenges, defining strategy (with OKRs), matching financial projections, and adapting in real time based on performance.</li>
+            <li>We cater to VC-backed startups (needing product‐market fit validation and investor‐ready projections) and VC firms (monitoring evolving portfolio needs), ensuring these pillars remain linked.</li>
+          </ul>
+
+          <h4 className="font-medium">How We Will Get There</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Provide a SaaS offering with monthly subscriptions so users have continuous access to iterative strategy development.</li>
+            <li>Integrate strategy, metrics, and finances in one platform, ensuring that changes in financial assumptions automatically reflect in strategic objectives and vice versa.</li>
+            <li>Offer premium consulting services for deeper engagements, especially where more customization and strategic insight is required by founders and VCs.</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">2. Vision, Mission & Business Goals</h3>
+          <h4 className="font-medium">Vision</h4>
+          <p className="mb-4">To become the industry-standard AI tool that redefines strategic planning by seamlessly integrating systems thinking, strategy formulation, financial projection and operational metrics — guiding both startups and their investors towards resilience, alignment and data‐driven success.</p>
+
+          <h4 className="font-medium">Mission</h4>
+          <p className="mb-4">We enable and empower startups and VCs to adapt swiftly and align their strategic decisions, action plans (OKRs), and financial projections in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is coherent, evidence‐based, and future‐resilient.</p>
+
+          <h4 className="font-medium">Business Goals</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Profit Every Year: Reach operational profitability for NEO within 2 years and contribute significantly to overall revenue growth. Avoid negative net margins by aligning staff expansion and R&D with actual MRR.</li>
+            <li>Continuous growth in profit: continuous growth in profit margins and net profit with digital products.</li>
+            <li>Productivity gains: Demonstrate a 50% reduction in planning cycle times for users compared to traditional methods.</li>
+            <li>NPS score: Attain a customer satisfaction rating of over 90% within the first 18 months.</li>
+            <li>Market Penetration: Achieve market penetration in the strategic planning software space by capturing at least 20% of the target market within 3 years.</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">3. Diagnosis of the Challenge</h3>
+          <h4 className="font-medium">Root Problems</h4>
+          <ol className="list-decimal pl-5 mb-4">
+            <li className="mb-2">
+              <strong>Integration Gap in Strategic Tools:</strong>
+              <ul className="list-disc pl-5 mt-1">
+                <li>Existing tools address either strategy formulation, financial projections, or OKRs in isolation</li>
+                <li>No solution effectively unifies systems thinking, strategy, and financial modeling in one platform</li>
+                <li>Organizations struggle with disconnected tools leading to strategic-financial misalignment</li>
+              </ul>
+            </li>
+            <li className="mb-2">
+              <strong>Market Adoption Barriers:</strong>
+              <ul className="list-disc pl-5 mt-1">
+                <li>Startups and SMEs are hesitant to adopt new strategic planning tools</li>
+                <li>High customer education requirement as systems thinking is not widely understood</li>
+                <li>Initial pricing resistance for an unproven but premium-positioned solution</li>
+              </ul>
+            </li>
+            <li className="mb-2">
+              <strong>Resource Constraints:</strong>
+              <ul className="list-disc pl-5 mt-1">
+                <li>Limited initial resources to simultaneously build robust product features, marketing presence, and support capabilities</li>
+                <li>Challenge of balancing founder time between sales (pilot engagements), product development, and strategic partnerships</li>
+                <li>Funding limitations requiring careful resource allocation without compromising quality</li>
+              </ul>
+            </li>
+            <li className="mb-2">
+              <strong>AI Integration Complexities:</strong>
+              <ul className="list-disc pl-5 mt-1">
+                <li>Technical challenge of ensuring consistent AI outputs across various strategy frameworks</li>
+                <li>Potential model deprecation or changes could break core functionality</li>
+                <li>Maintaining data security and privacy while leveraging AI capabilities</li>
+              </ul>
+            </li>
+            <li className="mb-2">
+              <strong>Competitive Differentiation:</strong>
+              <ul className="list-disc pl-5 mt-1">
+                <li>Risk of being perceived as "just another strategy tool" or "just another AI implementation"</li>
+                <li>Need to establish clear value demonstration for different user segments (founders vs. VCs)</li>
+                <li>Balancing depth of functionality with ease of use and implementation</li>
+              </ul>
+            </li>
+          </ol>
+
+          <h4 className="font-medium">External Drivers</h4>
+          <div className="mb-6">
+            <p className="font-medium">Market & Technology Factors:</p>
+            <ul className="list-disc pl-5 mb-4">
+              <li>Growing demand for real-time strategic insights amid economic uncertainty</li>
+              <li>Increasing acceptance of AI-powered business tools</li>
+              <li>Remote/distributed teams require centralized strategic collaboration</li>
+              <li>Shift toward data-driven decision-making in strategy development</li>
+            </ul>
+
+            <p className="font-medium">Competitive Environment:</p>
+            <ul className="list-disc pl-5 mb-4">
+              <li>Risk of established consulting firms developing similar digital offerings</li>
+              <li>Potential for larger SaaS platforms to add strategic planning modules</li>
+              <li>Emergence of specialized AI tools that address portions of the strategic planning process</li>
+            </ul>
+
+            <p className="font-medium">Regulatory & Security Considerations:</p>
+            <ul className="list-disc pl-5 mb-4">
+              <li>Evolving AI regulations might impact how NEO processes and stores strategic data</li>
+              <li>Data privacy concerns, especially with financial and strategic information</li>
+              <li>Transparency requirements around AI-generated content and recommendations</li>
+            </ul>
+          </div>
+
+          <h3 className="text-lg font-semibold mb-2">4. Where to Play (Market & Positioning Choices)</h3>
+          <h4 className="font-medium">Primary Segments</h4>
+          
+          <div className="mb-4">
+            <h5 className="font-medium">VC-Backed Startups (Growth Stage)</h5>
+            <p className="font-medium mt-2">Jobs to be Done:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Refine product-market fit and validate strategic direction while scaling</li>
+              <li>Create consistent, investor-ready documentation that aligns strategy with financial projections</li>
+              <li>Track KPIs and metrics that demonstrate growth and validate the business model</li>
+              <li>Make data-driven decisions about pivoting or doubling down on current strategies</li>
+              <li>Effectively communicate strategic changes and financial impacts to investors and board members</li>
+              <li>Scale operations while preserving the agility and innovation that drove initial success</li>
+            </ul>
+
+            <p className="font-medium mt-2">Pains:</p>
+            <ul className="list-disc pl-5 mb-2">
+              <li>Strategic misalignment between departments as company grows (60% fail due to poor strategy-execution alignment)</li>
+              <li>Fragmented tools (Excel, Asana, QuickBooks) that don't synchronize, creating inconsistent data</li>
+              <li>Reactive decision-making with manual scenario modeling taking weeks, delaying market responses</li>
+              <li>Lack of real-time data to justify pivots to investors</li>
+              <li>KPI/OKR confusion with teams tracking 50+ metrics without understanding which directly impact survival/growth</li>
+              <li>Only 22% of employees can name their company's top 3 OKRs</li>
+              <li>Scaling inefficiencies where rapid hiring/growth creates operational chaos</li>
+              <li>Time-consuming investor reporting that feels disconnected from operational reality</li>
+            </ul>
+
+            <p className="font-medium mt-2">Gains:</p>
+            <ul className="list-disc pl-5 mb-4">
+              <li>Reduced time to pivot from 6-9 months to 3 weeks</li>
+              <li>Alignment between strategic decisions, OKRs, and financial projections</li>
+              <li>Data-driven confidence in strategic decisions</li>
+              <li>Clear visibility into which metrics truly impact growth and sustainability</li>
+              <li>Ability to quickly model different scenarios and their financial implications</li>
+              <li>Improved investor relations through consistent, transparent reporting</li>
+              <li>Preserved culture and innovation during scaling</li>
+            </ul>
+          </div>
+
+          <h4 className="font-medium">Geographic Focus</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Start local (DACH region) for initial traction, expand globally via remote SaaS.</li>
+          </ul>
+
+          <h4 className="font-medium">Channels</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Direct Outreach to VC networks & accelerators.</li>
+            <li>Digital self‐serve signups for early‐stage founders.</li>
+            <li>LinkedIn and Website for marketing and sales</li>
+            <li>Partnerships with financial software or strategic consultancies for joint go‐to‐market.</li>
+          </ul>
+
+          <h4 className="font-medium">Market Positioning</h4>
+          <p className="mb-6">NEO is positioned as a cutting-edge, intelligent strategic partner—offering a unified platform that transforms complex strategic challenges into clear, actionable plans. Its value lies in its ability to reduce manual effort, speed up decision-making, and ensure continuous alignment between strategy and financial performance.</p>
+
+          <h3 className="text-lg font-semibold mb-2">5. How to Win (Competitive Advantage & Unique Value Proposition)</h3>
+          <h4 className="font-medium">Current Challenge in the Market</h4>
+          <p className="mb-4">Traditional strategy development is fragmented, static, and lacks integration between strategic vision and financial realities. Business management tools exist in silos. Companies use one tool for strategic planning, another for financial modeling, a third for OKRs, and nothing connects them. When market conditions change, updating all these elements becomes time-consuming and error-prone due to human intervention.</p>
+
+          <p className="mb-4">In short, current strategy tools are either:</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Too theoretical (strategy frameworks without implementation guidance)</li>
+            <li>Too tactical (financial spreadsheets without strategic context)</li>
+            <li>Too rigid (templates that don't adapt to business evolution)</li>
+            <li>Too fragmented (separate tools for strategy, finance, and execution)</li>
+          </ul>
+
+          <h4 className="font-medium">NEO's Proprietary AI Solution</h4>
+          <p className="mb-2">NEO's AI approach is uniquely powerful because:</p>
+          <ol className="list-decimal pl-5 mb-4">
+            <li>Synchronized Systems Architecture: Our proprietary document synchronization engine ensures any change in one strategic element automatically triggers intelligent updates across all other documents.</li>
+            <li>Strategy-Finance Integration Algorithm: We've developed a specialized AI model that translates strategic decisions directly into financial implications and vice versa.</li>
+            <li>Adaptive Strategy Evolution Engine: Our unique AI capability learns from strategy implementation data, creating a continuous improvement cycle.</li>
+            <li>Dynamic Strategy Canvas: Unlike static business model canvases, our Dynamic Strategy Canvas continuously evolves as the business learns and market conditions change.</li>
+            <li>Investor-Ready Outputs: NEO produces professional-quality outputs specifically designed to appeal to venture capital firms.</li>
+            <li>AI-Powered Scenario Planning: NEO generates multidimensional scenario analyses based on key assumptions.</li>
+            <li>Implementation-First Approach: NEO bridges the strategy-execution gap by converting strategic intentions directly into actionable OKRs.</li>
+            <li>Continuous Adaptation Framework: NEO ensures strategies evolve based on market feedback and performance data.</li>
+            <li>End-to-End Strategy Integration: NEO seamlessly connects strategy formulation, financial projection, and execution tracking.</li>
+          </ol>
+
+          <h3 className="text-lg font-semibold mb-2">6. Guiding Policy (Strategic Principles & Trade‐offs)</h3>
+          <h4 className="font-medium">Strategic Principles:</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Focus on Integration: Always align strategy with financial and operational realities.</li>
+            <li>Embrace Systems Thinking: Use holistic analysis and feedback loops.</li>
+            <li>Prioritize Customer Success: Design solutions that ensure long-term customer retention.</li>
+            <li>Agile Adaptation: Be prepared to pivot based on real-time data.</li>
+            <li>Monitor monthly net margin: Phase in expenses gradually to maintain profitability.</li>
+            <li>Carefully monitor OPEX: Restrict expansions to avoid overspending.</li>
+            <li>Preserve a Minimal Marketing Budget: Focus on word of mouth and inbound content.</li>
+            <li>Slight price premium: Justify higher monthly fees with unique value proposition.</li>
+            <li>Emphasize Premium Value: Maintain identity as a "close, personalized" solution.</li>
+            <li>Limit consulting or implement standardized packages.</li>
+          </ul>
+
+          <h4 className="font-medium">Trade-offs:</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Prioritize long-term strategic alignment over short-term revenue gains.</li>
+            <li>Invest in robust, scalable technology even if initial costs are higher.</li>
+            <li>Focus on depth of service and simplicity rather than generic solutions.</li>
+            <li>Deliver simple but functional solutions for small businesses.</li>
+            <li>Ensure high quality content rather than new features.</li>
+            <li>Won't chase hyper‐scaling or huge marketing blasts.</li>
+            <li>Won't overspend in fear of being overrun.</li>
+            <li>Won't drastically discount to gain mass users.</li>
+            <li>Not a free or low‐end financial tool.</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">7. Key Strategic Priorities & Focus Areas</h3>
+          <h4 className="font-medium">Product Development & Innovation:</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Continuously iterate the user interface for a seamless experience.</li>
+            <li>Ongoing, user‐driven improvements.</li>
+            <li>Enhance AI capabilities in systems thinking and financial forecasting.</li>
+          </ul>
+
+          <h4 className="font-medium">Market Expansion & Customer Acquisition:</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Target early adopters in the startup ecosystem.</li>
+            <li>Develop robust digital marketing and thought leadership.</li>
+            <li>Predefined annual marketing budget for content and community.</li>
+            <li>Build relationships with VCs and growth‐stage startups.</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">8. Execution Plan (Coherent Actions & Resource Allocation)</h3>
+          <h4 className="font-medium">Phase 1 (0–6 Months)</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>MVP with essential synergy features</li>
+            <li>Secure 10–15 pilot customers</li>
+            <li>Gather feedback for improvement</li>
+            <li>Initiate digital marketing campaigns</li>
+          </ul>
+
+          <h4 className="font-medium">Phase 2 (6–12 Months)</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Lean R&D expansions</li>
+            <li>Expand subscription tiers</li>
+            <li>Expand brand presence</li>
+            <li>Build a small team for support</li>
+          </ul>
+
+          <h4 className="font-medium">Phase 3 (Year 2+)</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Staff additions based on MRR thresholds</li>
+            <li>Implement "client cap" or waitlist</li>
+            <li>Evaluate global expansions</li>
+            <li>Introduce additional modules</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">9. Risk Management & Resilience</h3>
+          <h4 className="font-medium">Key Risks</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Market Acceptance Risk: Resistance to new tools</li>
+            <li>Competitive Risk: Larger players replicating features</li>
+            <li>Scaling Risk: Growth straining support</li>
+            <li>Churn Risk: Failure to deliver continuous value</li>
+            <li>Market Acceptance: Heavy reliance on digital offerings</li>
+            <li>Limited Consulting: Digital uptake challenges</li>
+            <li>Competitive Pressure: Larger marketing budgets</li>
+            <li>Tax & Regulatory Changes: Policy shifts</li>
+          </ul>
+
+          <h4 className="font-medium">Mitigation Strategies</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Seamless onboarding and early feedback loops</li>
+            <li>Targeted content and community building</li>
+            <li>Modular, high-margin packages</li>
+            <li>Continuous differentiation</li>
+            <li>Strong user engagement and retention</li>
+            <li>Buffer & scenario planning</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">10. Performance Metrics & Success Measures</h3>
+          <h4 className="font-medium">Leading Indicators</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Monthly Churn Rate below 5%</li>
+            <li>New Startup Signups/Month from referrals</li>
+            <li>Partnership Conversions</li>
+            <li>Net Profit remaining positive</li>
+            <li>Monthly Recurring Revenue (MRR)</li>
+          </ul>
+
+          <h4 className="font-medium">Lagging Indicators</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>MRR Growth per quarter</li>
+            <li>Net Promoter Score (NPS)</li>
+            <li>Consulting Revenue ratio</li>
+            <li>Team Growth based on MRR</li>
+          </ul>
+
+          <h4 className="font-medium">Review Cadence</h4>
+          <ul className="list-disc pl-5 mb-6">
+            <li>Monthly: Evaluate metrics and patterns</li>
+            <li>Quarterly: Strategic updates and pivots</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">11. Long-Term Sustainability & Evolution</h3>
+          <h4 className="font-medium">Sustainability Strategy</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Invest in continuous R&D</li>
+            <li>Cultivate innovation culture</li>
+            <li>Expand service ecosystem</li>
+          </ul>
+
+          <h4 className="font-medium">Evolution Strategy</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Regular strategic framework updates</li>
+            <li>Foster strategic partnerships</li>
+            <li>Balance efficiency with growth</li>
+          </ul>
+        </div>
+      </div>
+    ),
+    'Financial Projection': (
+      <div className="p-4">
+        <h2 className="text-xl font-bold mb-4">NEO Financial Projections (5-Year Plan)</h2>
+        <div className="prose prose-sm max-w-none">
+          
+          <h3 className="text-lg font-semibold mb-2">1. Working Days Calculation</h3>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Calendar Days: 365</li>
+            <li>Non-Working Days:
+              <ul className="list-none pl-5">
+                <li>- Weekend Days: 104</li>
+                <li>- Public Holidays: 11</li>
+                <li>- Vacation Days: 30</li>
+                <li>- Sick Days: 5</li>
+                <li>- Training/Admin: 12</li>
+              </ul>
+            </li>
+            <li>Net Available Working Days: 203</li>
+            <li>Maximum Utilization Rate: 80%</li>
+            <li>Maximum Billable Days: 162</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">2. Revenue Streams</h3>
+          
+          <h4 className="font-medium">Digital Revenue</h4>
+          <p className="mb-2">Basic Subscription (Test Version):</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Subscriptions Growth: 150 → 2400</li>
+            <li>Price: Free trial version</li>
+            <li>Churn Rate: 0%</li>
+            <li>Revenue: €0 (Free tier)</li>
+          </ul>
+
+          <p className="mb-2">Professional Subscription:</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Conversion Rate from Basic: 40%</li>
+            <li>Subscriptions Growth: 60 → 960</li>
+            <li>Price: €999/month</li>
+            <li>Churn Rate: 2% monthly (24% yearly)</li>
+            <li>Revenue Growth: €546,653 → €8,746,445</li>
+          </ul>
+
+          <p className="mb-2">Enterprise Subscription:</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Subscriptions Growth: 1 → 15</li>
+            <li>Price: €2,999/month</li>
+            <li>Churn Rate: 2% monthly (24% yearly)</li>
+            <li>Revenue Growth: €27,351 → €410,263</li>
+          </ul>
+
+          <h4 className="font-medium mt-4">Service Revenue</h4>
+          <p className="mb-2">Basic Setup (5 days):</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Conversion Rate: 20% from Basic</li>
+            <li>Cost per Implementation: €10,000</li>
+            <li>Implementations: 30 → 480</li>
+            <li>Revenue Growth: €300,000 → €4,800,000</li>
+          </ul>
+
+          <p className="mb-2">Professional Onboarding (10 days):</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Conversion Rate: 20% from Professional</li>
+            <li>Cost per Implementation: €20,000</li>
+            <li>Implementations: 12 → 192</li>
+            <li>Revenue Growth: €240,000 → €3,840,000</li>
+          </ul>
+
+          <p className="mb-2">Enterprise Implementation (30 days):</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Conversion Rate: 20% from Enterprise</li>
+            <li>Cost per Implementation: €40,000</li>
+            <li>Implementations: 0 → 3</li>
+            <li>Revenue Growth: €0 → €120,000</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">3. Cost Structure</h3>
+          
+          <h4 className="font-medium">COGS Breakdown</h4>
+          <p className="mb-2">Digital Revenue COGS (10% of revenue):</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Cloud Infrastructure: €11,480 → €183,134</li>
+            <li>Database Costs: €11,480 → €183,134</li>
+            <li>Third-party API Licenses: €11,480 → €183,134</li>
+            <li>Customer Support Tools: €22,960 → €366,268</li>
+          </ul>
+
+          <p className="mb-2">Consulting Services COGS:</p>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Direct Consultant Salaries: €150,000 → €4,200,000</li>
+            <li>Client Project Travel: €4,500 → €72,000</li>
+            <li>Project Materials: €1,500 → €24,000</li>
+            <li>Total COGS: €213,400 → €5,211,671</li>
+          </ul>
+
+          <h4 className="font-medium">Operating Expenses (OPEX)</h4>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Tech & Infrastructure: €14,500 → €47,000</li>
+            <li>Marketing (15% of revenue): €167,101 → €2,687,506</li>
+            <li>Capability Development (5%): €55,700 → €895,838</li>
+            <li>Growth Investments (5%): €55,700 → €895,835</li>
+            <li>Total OPEX: €296,501 → €4,739,180</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">4. Profitability Summary</h3>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Total Revenue: €1,114,004 → €17,916,708</li>
+            <li>Total Costs: €509,901 → €9,950,851</li>
+            <li>Net Profit: €332,256 → €4,381,221</li>
+            <li>Net Profit Margin: 30% → 24%</li>
+          </ul>
+
+          <h3 className="text-lg font-semibold mb-2">5. Key Metrics</h3>
+          <ul className="list-disc pl-5 mb-4">
+            <li>Digital Products:
+              <ul className="list-none pl-5">
+                <li>- Total Subscribers: 211 → 3,375</li>
+                <li>- LTV:CAC Ratio: 4-5x</li>
+              </ul>
+            </li>
+            <li>Services:
+              <ul className="list-none pl-5">
+                <li>- Active Clients: 42 → 675</li>
+                <li>- LTV:CAC Ratio: 4-6x</li>
+              </ul>
+            </li>
+            <li>Cash Flow:
+              <ul className="list-none pl-5">
+                <li>- Operating Buffer: 10%</li>
+                <li>- Monthly Net Profit: €27,688 → €365,102</li>
+              </ul>
+            </li>
+          </ul>
+        </div>
+      </div>
+    ),
+    OKRs: (
+      <div className="p-4">
+        <h2 className="text-xl font-bold mb-4">NEO – Objectives and Key Results derived from Strategy</h2>
+        <div className="prose prose-sm max-w-none">
+          {/* Objective 1 */}
+          <div className="mb-8 bg-blue-50 p-4 rounded">
+            <h3 className="text-lg font-semibold mb-2">Objective 1: Achieve €100K in Total First-Year Revenue</h3>
+            <p className="italic mb-3">Rationale: Secure short-term financial viability, build investor confidence, and lay the foundation for scaling.</p>
+            <h4 className="font-medium mb-2">Key Results</h4>
+            <ol className="list-decimal pl-5">
+              <li>Generate a minimum of €8,300 in Monthly Recurring Revenue (MRR) by Month 12.</li>
+              <li>Close at least 8 high-ticket pilot engagements or consulting deals (≥ €5,000 each) within Year 1.</li>
+              <li>Convert at least 40% of new signups to Pro (€99/mo) or Enterprise (€299/mo) tiers on an annual plan.</li>
+              <li>Maintain an average 30-day sales cycle (from lead to closed deal) or less for B2B pilot offerings.</li>
+              <li>Achieve an average revenue per user (ARPU) of at least €80 across all paying subscribers in Year 1.</li>
+            </ol>
+          </div>
+
+          {/* Objective 2 */}
+          <div className="mb-8 bg-green-50 p-4 rounded">
+            <h3 className="text-lg font-semibold mb-2">Objective 2: Grow Subscription Base & Reduce Churn</h3>
+            <p className="italic mb-3">Rationale: Establish strong, recurring subscription income and foster stable user retention, particularly for high-value tiers.</p>
+            <h4 className="font-medium mb-2">Key Results</h4>
+            <ol className="list-decimal pl-5">
+              <li>Reach 300 total paying subscribers by end of Year 1 (across all tiers).</li>
+              <li>Maintain a monthly churn rate below 5% after the first 3 months of launch.</li>
+              <li>Attain ≥ 40% of subscribers on Pro or Enterprise plans within 6 months.</li>
+              <li>Achieve ≥ 20% subscription upgrades (e.g., from Basic to Pro or Enterprise) by end of Year 1.</li>
+              <li>Limit free trial to paid conversion time to a median of 10 days or fewer.</li>
+            </ol>
+          </div>
+
+          {/* Objective 3 */}
+          <div className="mb-8 bg-purple-50 p-4 rounded">
+            <h3 className="text-lg font-semibold mb-2">Objective 3: Deliver Exceptional Customer Satisfaction & ROI</h3>
+            <p className="italic mb-3">Rationale: Differentiate NEO through quality user experience, robust strategic insights, and clear value—driving long-term loyalty and word-of-mouth.</p>
+            <h4 className="font-medium mb-2">Key Results</h4>
+            <ol className="list-decimal pl-5">
+              <li>Maintain a Customer Satisfaction Score ≥ 90% across all paying tiers (via quarterly surveys).</li>
+              <li>Attain an NPS (Net Promoter Score) ≥ 50 by Year 1, indicating strong brand advocacy.</li>
+              <li>Log at least 10 verified ROI case studies (e.g., cost savings, revenue growth, successful pivots) from Pro/Enterprise clients.</li>
+              <li>Time-to-Value under 14 days for new signups—measure how quickly new users complete a meaningful strategic/financial scenario.</li>
+              <li>Achieve a &lt;24-hour average response time for Enterprise-tier support tickets (and &lt;48 hours for all tiers).</li>
+            </ol>
+          </div>
+
+          {/* Objective 4 */}
+          <div className="mb-8 bg-yellow-50 p-4 rounded">
+            <h3 className="text-lg font-semibold mb-2">Objective 4: Strengthen Market Presence & Channel Partnerships</h3>
+            <p className="italic mb-3">Rationale: Leverage strategic alliances and targeted marketing to efficiently attract leads who can afford higher-tier subscriptions.</p>
+            <h4 className="font-medium mb-2">Key Results</h4>
+            <ol className="list-decimal pl-5">
+              <li>Establish 2–3 formal accelerator or VC network partnerships that onboard at least 50 total Basic/Pro subscribers within the first 6 months.</li>
+              <li>Generate more than 1,000 qualified leads from LinkedIn Ads, webinars, and direct outreach by the end of Year 1.</li>
+              <li>Host a bi-weekly "NEO Live Demo" webinar with an average of 50+ attendees each, converting at least 10% to paying subscribers.</li>
+              <li>Secure 5 external blog posts or press mentions highlighting NEO's unique AI-driven strategy + finance approach.</li>
+              <li>Participate as a speaker or sponsor in 3 industry events or startup conferences, building brand credibility.</li>
+            </ol>
+          </div>
+
+          {/* Objective 5 */}
+          <div className="mb-8 bg-red-50 p-4 rounded">
+            <h3 className="text-lg font-semibold mb-2">Objective 5: Rapid Product & AI Enhancement Aligned with User Needs</h3>
+            <p className="italic mb-3">Rationale: Continuously evolve NEO's capabilities to retain competitive edge, especially at premium price points.</p>
+            <h4 className="font-medium mb-2">Key Results</h4>
+            <ol className="list-decimal pl-5">
+              <li>Implement 5 top-voted feature requests from Enterprise tier clients each quarter, ensuring high perceived value at €299/mo.</li>
+              <li>Release 2 major AI improvements (e.g., advanced scenario planning or deeper financial modeling modules) within the first 9 months.</li>
+              <li>Maintain a monthly product iteration cycle—each iteration addresses at least 1 critical user feedback item from the pilot or Pro/Enterprise customers.</li>
+              <li>Achieve a product uptime of 99.9% and keep bug resolution time under 72 hours on average.</li>
+              <li>Conduct quarterly user-experience audits, ensuring that key workflows require ≤ 3 clicks to reach the main strategic or financial outcome screens.</li>
+            </ol>
+          </div>
+
+          {/* Objective 6 */}
+          <div className="mb-8 bg-indigo-50 p-4 rounded">
+            <h3 className="text-lg font-semibold mb-2">Objective 6: Operational Efficiency & Resource Allocation</h3>
+            <p className="italic mb-3">Rationale: Ensure stable internal processes despite rapid customer expansion and rising demands on support or custom engagements.</p>
+            <h4 className="font-medium mb-2">Key Results</h4>
+            <ol className="list-decimal pl-5">
+              <li>Dedicate ≥ 30% of your weekly schedule to direct sales and pilot‐engagement calls, ensuring pipeline momentum.</li>
+              <li>Onboard 1–2 reliable freelancers/contractors for either marketing or development by Month 6, freeing up founder time for high-value tasks.</li>
+              <li>Keep monthly burn rate under €X (appropriate for your budget constraints) while maintaining planned OPEX for growth.</li>
+              <li>Maintain a 3-month runway of operating cash in the bank at all times.</li>
+              <li>Achieve a funnel conversion rate (from leads to paying customers) of ≥ 10% across all digital channels.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    )
   });
 
   // Initialize systemic issues
@@ -217,16 +1101,131 @@ const NEOStrategyPlatform = () => {
     ]
   };
 
+  const [fileLocation, setFileLocation] = useState<FileLocation | null>(null);
+  const [showFileSetup, setShowFileSetup] = useState(false);
+  const [strategyDocument, setStrategyDocument] = useState<{ content: string }>({ content: '' });
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    const initializeApp = async () => {
+      try {
+        console.log('Initializing app...');
+        const location = await FileService.getFileLocation();
+        console.log('Retrieved file location:', location);
+        
+        if (location) {
+          setFileLocation(location);
+          await loadDocuments(location);
+        } else {
+          console.log('No file location found, showing setup modal');
+          setShowFileSetup(true);
+        }
+      } catch (error) {
+        console.error('Error initializing app:', error);
+        setShowFileSetup(true);
+      }
+    };
+
+    initializeApp();
+  }, []);
+
+  const loadDocuments = async (location: FileLocation) => {
+    try {
+      console.log('Loading documents from location:', location);
+      // TODO: Implement document loading from the saved location
+      // This will involve reading the JSON files and updating the state
+      setHasDocuments(true);
+    } catch (error) {
+      console.error('Error loading documents:', error);
+      setError('Failed to load documents');
+    }
+  };
+
+  const handleFileSetupComplete = async (location: FileLocation) => {
+    try {
+      console.log('File setup completed with location:', location);
+      setFileLocation(location);
+      setShowFileSetup(false);
+      await loadDocuments(location);
+      setSuccessMessage('File setup completed successfully');
+    } catch (error) {
+      console.error('Error handling file setup completion:', error);
+      setError('Failed to complete file setup');
+    }
+  };
+
+  // Function to check for inconsistencies between documents
+  const checkInconsistencies = (assignments: Record<DocumentType, string>) => {
+    const newCounts: Record<DocumentType, number> = {
+      'Canvas': 0,
+      'Strategy': 0,
+      'Financial Projection': 0,
+      'OKRs': 0
+    };
+
+    // Only check for inconsistencies if at least 2 documents are assigned
+    const assignedDocuments = Object.entries(assignments).filter(([_, path]) => path !== '');
+    if (assignedDocuments.length < 2) {
+      setInconsistencyCount(newCounts);
+      return;
+    }
+
+    // Check for inconsistencies between assigned documents
+    assignedDocuments.forEach(([docType, path]) => {
+      const currentDocType = docType as DocumentType;
+      
+      // Example inconsistency checks (modify based on your actual requirements)
+      if (currentDocType === 'Strategy' && assignments['OKRs'] !== '') {
+        // Check for strategy-OKR alignment
+        newCounts['Strategy']++;
+        newCounts['OKRs']++;
+      }
+      
+      if (currentDocType === 'Canvas' && assignments['OKRs'] !== '') {
+        // Check for canvas-OKR alignment
+        newCounts['Canvas']++;
+        newCounts['OKRs']++;
+      }
+      
+      if (currentDocType === 'Strategy' && assignments['Financial Projection'] !== '') {
+        // Check for strategy-financial alignment
+        newCounts['Strategy']++;
+        newCounts['Financial Projection']++;
+      }
+    });
+
+    setInconsistencyCount(newCounts);
+  };
+
   // Initialize on client-side only
   useEffect(() => {
     setIsClient(true);
     
     if (typeof window !== 'undefined') {
+      // Load document assignments from localStorage
+      const savedAssignments = localStorage.getItem('neoDocumentAssignments');
+      if (savedAssignments) {
+        const assignments = JSON.parse(savedAssignments);
+        setDocumentAssignments(assignments);
+        checkInconsistencies(assignments);
+      } else {
+        // Reset inconsistency counts if no assignments exist
+        setInconsistencyCount({
+          'Canvas': 0,
+          'Strategy': 0,
+          'Financial Projection': 0,
+          'OKRs': 0
+        });
+      }
+      
       // Set up initial Claude response
       setClaudeResponses([{
         id: 1,
-        response: "I've analyzed your strategy document and financial projections. There are several areas where the OKRs could be better aligned with your financial goals. Would you like me to suggest specific improvements?"
+        response: "Welcome to NEO Strategy Platform. Please select your documents to begin analyzing your strategy."
       }]);
+      
+      // Load document assignments
+      FileSystemService.loadDocumentAssignments();
       
       // Get storage directory from localStorage
       setStorageDirectory(localStorage.getItem('neoStorageDirectory') || '');
@@ -236,108 +1235,788 @@ const NEOStrategyPlatform = () => {
       database.initializeData();
       setDb(database);
       
-      // Initialize proper document content
+      // Initialize document content with empty states
       setDocumentContent({
         Canvas: (
           <div className="p-4">
-            <h2 className="text-xl font-bold mb-4">Enhanced Strategy Canvas - NEO</h2>
-            <h3 className="text-lg font-semibold mb-2">Business Model (Value Creation & Economic Viability)</h3>
+            <h2 className="text-xl font-bold mb-4">NEO - Enhanced Strategy Canvas</h2>
+            <div className="prose prose-sm max-w-none">
+              <h3 className="text-lg font-semibold mb-2">Section 1: Business Model (Value Creation & Economic Viability)</h3>
+              
+              <h4 className="font-medium">1. Customer Segments</h4>
             <div className="mb-4">
-              <h4 className="font-medium">Customer Segments</h4>
-              <ul className="list-disc pl-5">
-                <li>Early‐ to Growth‐Stage Startups</li>
-                <li>SMEs / Mittelstand</li>
-                <li>Boutique Consultancies</li>
+                <p className="font-medium">Early‐ to Growth‐Stage Startups</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Need integrated strategy + financial modeling</li>
+                  <li>Seek quick insights on product–market fit and pivot timing</li>
+                  <li>Comfortable with AI and new tech tools</li>
+                </ul>
+
+                <p className="font-medium">SMEs / Mittelstand</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Require advanced scenario analysis (e.g., cost optimization)</li>
+                  <li>Traditional but under competitive + cost pressures</li>
+                  <li>Interested in partial automation of strategic planning</li>
+                </ul>
+
+                <p className="font-medium">Boutique Consultancies</p>
+                <ul className="list-disc pl-5 mb-4">
+                  <li>Potential to white‐label or embed NEO in client engagements</li>
+                  <li>Value add: Automated strategy assessment + robust financial modules</li>
               </ul>
             </div>
+
+              <h4 className="font-medium">2. Value Proposition</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Integrated AI for Strategy, Systems Thinking & Finance: Single tool unifying strategic planning, system dynamics, and real‐time financial projections.</li>
+                <li>Minimal Effort, High Impact: NEO's interface and guided Q&A help non‐technical teams quickly produce consistent strategies + cash flow forecasts.</li>
+                <li>High‐Touch + Self‐Serve: Subscription tiers from Basic to Enterprise, plus optional short-run pilot packages for immediate lumpsum value + advanced support.</li>
+              </ul>
+
+              <h4 className="font-medium">3. Revenue Model</h4>
             <div className="mb-4">
-              <h4 className="font-medium">Value Proposition</h4>
-              <ul className="list-disc pl-5">
-                <li>Integrated AI for Strategy, Systems Thinking & Finance</li>
-                <li>Minimal Effort, High Impact</li>
-                <li>High‐Touch + Self‐Serve</li>
+                <p className="font-medium">Subscription Tiers</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Basic @ €49/mo: Core strategy interface + essential AI prompts</li>
+                  <li>Pro @ €99/mo: Deeper scenario planning, advanced analytics, partial priority support</li>
+                  <li>Enterprise @ €299/mo: Full feature set, premium support, potential customization</li>
+              </ul>
+
+                <p className="font-medium">Pilot Engagements & Consulting</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Short-run "Strategy Accelerator" packages at €5–10k each</li>
+                  <li>Retainer options for ongoing advisory or extended support</li>
+                </ul>
+
+                <p className="italic">Goal: Combine recurring subscription MRR (~€8.3k needed by Month 12) with pilot deals to surpass €100k total revenue in Year 1.</p>
+              </div>
+
+              <h4 className="font-medium">4. Cost Structure & Resource Allocation</h4>
+              <div className="mb-4">
+                <p className="font-medium">Fixed / Operational Costs:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Tech stack (infrastructure, software subscriptions), marketing campaigns, some development resources (potential freelancers)</li>
+                </ul>
+
+                <p className="font-medium">Variable Costs:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Travel for in‐person pilot engagements, potential commissions for referral partnerships</li>
+                </ul>
+
+                <p className="italic">Emphasis: Lean operations but allocate enough to high‐ROI marketing (LinkedIn, partnership events) to secure pilot deals quickly.</p>
+              </div>
+
+              <h4 className="font-medium">5. Channels & Go‐to‐Market Strategy</h4>
+              <div className="mb-4">
+                <p className="font-medium">Digital Presence</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Targeted LinkedIn Ads for startup founders / scale‐up CEOs</li>
+                  <li>Bi‐weekly NEO Live Demo Webinars (drive immediate signups or pilot interest)</li>
+                  <li>Thought leadership content (blog posts, short LinkedIn articles) focusing on synergy of AI + strategic finance</li>
+                </ul>
+
+                <p className="font-medium">Partnerships</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>2–3 startup accelerators or VC networks with special deals for portfolio companies</li>
+                  <li>Potential collaborations with boutique consulting firms</li>
+                </ul>
+
+                <p className="font-medium">Direct Sales</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Founder‐led outbound to ~20–30 leads monthly, focusing on Enterprise or pilot deals</li>
+                  <li>Fast follow‐ups on inbound leads from events / content marketing</li>
+                </ul>
+              </div>
+
+              <h4 className="font-medium">6. Key Activities</h4>
+              <div className="mb-4">
+                <p className="font-medium">Product Development:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Maintain monthly iteration cycles; implement top user requests for advanced analytics / financial modeling</li>
+                </ul>
+
+                <p className="font-medium">Marketing & Sales:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Execute 2–3 targeted campaigns per quarter</li>
+                  <li>Conduct live demos, manage pilot engagements, sign annual Enterprise deals</li>
+                </ul>
+
+                <p className="font-medium">Customer Success:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Onboarding flows for Basic, Pro, Enterprise</li>
+                  <li>Priority support + best‐practice sharing for pilot engagement clients</li>
+                </ul>
+              </div>
+
+              <h4 className="font-medium">7. Key Partnerships & Ecosystem</h4>
+              <div className="mb-6">
+                <p className="font-medium">Startup Incubators / Accelerators</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Bulk onboarding of early‐stage startups at Basic or Pro tiers</li>
+                  <li>Revenue share or discount codes in exchange for co‐branding</li>
+                </ul>
+
+                <p className="font-medium">SME Networks & Trade Organizations</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Introductory webcasts explaining AI‐driven strategy for midsize businesses</li>
+                </ul>
+
+                <p className="font-medium">Consulting & Tech Alliances</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Partnerships with complementary SaaS (e.g., project management or CRM tools)</li>
+                  <li>Cross‐sell packages targeting companies wanting an end‐to‐end digital transformation</li>
+                </ul>
+              </div>
+
+              <h3 className="text-lg font-semibold mb-2">Section 2: Strategy (Competitive Positioning & Strategic Choices)</h3>
+              
+              <h4 className="font-medium">8. Market Definition & Competitive Landscape</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>AI‐Driven Strategy Tools: Growing but often siloed—few unify strategy, finance & system dynamics in one interface.</li>
+                <li>Generic Financial Projection Platforms: Excel add‐ons, basic CFO tools lacking deep strategic or AI support.</li>
+                <li>Traditional Consultancies: High cost, manual methods. Can't easily scale for smaller clients.</li>
+              </ul>
+
+              <h4 className="font-medium">9. Where to Play (Strategic Positioning)</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Focus on Founders + Growth‐Stage Firms: They value an AI tool that can quickly assess new revenue models, cost structures, break‐even points, pivot timing.</li>
+                <li>SMEs Seeking Competitive Modernization: Emphasize how NEO's advanced forecasting and scenario planning addresses cost pressures and digital transformation demands.</li>
+              </ul>
+
+              <h4 className="font-medium">10. How to Win (Competitive Advantage & Differentiation)</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Advanced AI: Specialized training in systems thinking, strategy frameworks, and integrated financial modeling.</li>
+                <li>Immediate ROI: Clear outcomes from pilot engagements; pay‐once for a "Strategy Accelerator," keep subscription for ongoing iteration.</li>
+                <li>Ease + Depth: Straightforward interface, but robust under the hood for advanced analytics.</li>
+              </ul>
+
+              <h4 className="font-medium">11. Trade‐offs & Focus Areas</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Prioritize Pilots Over General Low‐Tier Volume: Must close 8–10 higher‐value deals to ensure hitting €100k.</li>
+                <li>Limit Over‐Customization: Avoid building excessive features that only serve niche demands. Keep product agile but consistent.</li>
+              </ul>
+
+              <h4 className="font-medium">12. Key Capabilities & Organizational Strengths</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>AI Expertise: Efficiently convert large strategic / financial data sets into actionable insights.</li>
+                <li>Systems Thinking: Holistic approach ensures clients see beyond linear "input–output," fosters deeper scenario planning.</li>
+                <li>Sales + Consulting Experience: Ability to quickly build trust, pitch to top‐tier clients or accelerator cohorts.</li>
+              </ul>
+
+              <h4 className="font-medium">13. Business Model Scalability & Growth Strategy</h4>
+              <div className="mb-6">
+                <p className="font-medium">Year 1</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>€100k target via combined subscription + pilot revenues.</li>
+                  <li>300 paying subscribers, with 40% on Pro or Enterprise.</li>
+                </ul>
+
+                <p className="font-medium">Year 2–3</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Expand marketing channels, formal reseller partnerships.</li>
+                  <li>Potential new modules (sector‐specific expansions, deeper ESG or supply chain risk analyses).</li>
+                </ul>
+              </div>
+
+              <h3 className="text-lg font-semibold mb-2">Section 3: Systems Thinking (Resilience & Adaptability Mechanisms)</h3>
+              
+              <h4 className="font-medium">14. External Forces & Market Dynamics</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>AI Regulation & Data Privacy: Watch for shifts that might affect how we develop or handle financial data.</li>
+                <li>Economic Climate: If funding slows, pivot messaging to cost‐saving, ROI metrics.</li>
+                <li>Competitive Imitation: Expect new entrants. Keep distinctive synergy of strategy + finance + systems approach.</li>
+              </ul>
+
+              <h4 className="font-medium">15. Risk Factors & Uncertainty Mapping</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Pricing Resistance: Some early‐stage founders might balk at €299 for Enterprise. Mitigate via pilot ROI demos.</li>
+                <li>Resource Overextension: Founder's time is limited. Enlist help for marketing or user support if signups surge.</li>
+                <li>Dependence on Partnerships: If an accelerator partnership underdelivers on signups, pivot quickly to direct outreach.</li>
+              </ul>
+
+              <h4 className="font-medium">16. Leading Indicators & Early Warning Signals</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Pilot Deal Pipeline: If fewer than 2 pilot deals close in the first quarter, intensify direct outreach / discount promos.</li>
+                <li>Churn Rate: Spikes in monthly cancellations among Pro or Enterprise signups indicate product or onboarding issues.</li>
+                <li>Lead Volume from Partnerships: Track signups from each referral link or event; course‐correct if conversions lag.</li>
+              </ul>
+
+              <h4 className="font-medium">17. Feedback Loops & Learning Mechanisms</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>User Feedback Cycle: Gather monthly feedback from paying users. Rapidly implement top requests for scenario planning or advanced analytics.</li>
+                <li>Pilot "Success Stories": Each short‐run engagement must end with a postmortem to refine NEO's frameworks.</li>
+                <li>Quarterly Strategy Review: Evaluate go‐to‐market results, pivot marketing channels or pilot pricing if short of revenue targets.</li>
+              </ul>
+
+              <h4 className="font-medium">18. Scenario Planning & Contingency Strategies</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Best Case: Quick pilot wins, user base grows to 300+ at healthy Pro/Enterprise ratio, well over €100k.</li>
+                <li>Moderate: Slower pilot traction, must double down on partner channels, maybe lower initial pilot price to fill the pipeline.</li>
+                <li>Worst Case: Very low signups at new subscription levels, forcing promotional deals or pivot to a broader consulting focus.</li>
+              </ul>
+
+              <h4 className="font-medium">19. Long‐Term Sustainability & Competitive Evolution</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Continuous Innovation: Keep AI features relevant. Expand sectors (manufacturing, SaaS, healthcare).</li>
+                <li>Scaling Freedoms: Once subscription MRR is stable, invest in expansions (APIs, advanced reporting modules).</li>
+                <li>Global Market Reach: Localize the tool (languages, local compliance) if growth potential emerges internationally.</li>
               </ul>
             </div>
           </div>
         ),
         Strategy: (
           <div className="p-4">
-            <h2 className="text-xl font-bold mb-4">Strategy Document - NEO</h2>
-            <h3 className="text-lg font-semibold mb-2">Vision</h3>
-            <p className="mb-4">To become the standard integrated platform that continuously aligns a company's strategic plan, financial projections, and operational metrics—guiding both startups and their investors towards sustainable, data-driven success.</p>
-            
-            <h3 className="text-lg font-semibold mb-2">Mission</h3>
-            <p className="mb-4">NEO empowers startups and VCs to jointly create, track, and adapt cohesive strategies in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is dynamic, evidence-based, and future-resilient.</p>
-            
-            <h3 className="text-lg font-semibold mb-2">Business Goals</h3>
+            <h2 className="text-xl font-bold mb-4">Strategy Document for NEO</h2>
+            <div className="prose prose-sm max-w-none">
+              <h3 className="text-lg font-semibold mb-2">1. Strategic Narrative (Core Story)</h3>
+              <p>NEO is our next-generation AI tool engineered to revolutionize the way businesses develop and execute strategy. By harnessing advanced machine learning and systems analysis, NEO delivers real-time, actionable insights that empower users to align strategic planning with financial performance. NEO not only automates the strategic design process—integrating customer insights, operational data, and financial projections—but also provides dynamic feedback loops and scenario planning capabilities that adapt to market changes. Its mission is to transform complex strategic challenges into clear, data-driven action plans with minimal user effort.</p>
+              
+              <h4 className="font-medium mt-4">Where We Are Now</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Many startups and growing businesses create one‐off strategic documents that quickly become outdated, fail to link to financial projections, and do not adapt to changing market needs.</li>
+                <li>Venture Capital (VC) firms seek consistent, up‐to‐date insight into their portfolio companies but often rely on manual reporting.</li>
+                <li>Tools exist for strategy, for financial projections, and for OKR monitoring — but they rarely stay in sync.</li>
+              </ul>
+
+              <h4 className="font-medium">Where We Want to Go</h4>
             <ul className="list-disc pl-5 mb-4">
-              <li>Profit Every Year: Reach operational profitability within 2 years</li>
-              <li>Continuous growth in profit margins and net profit</li>
-              <li>Demonstrate 50% reduction in planning cycle times for users</li>
-              <li>Attain customer satisfaction rating over 90% within 18 months</li>
+                <li>NEO becomes the go-to platform for continuous strategic alignment: diagnosing challenges, defining strategy (with OKRs), matching financial projections, and adapting in real time based on performance.</li>
+                <li>We cater to VC-backed startups (needing product‐market fit validation and investor‐ready projections) and VC firms (monitoring evolving portfolio needs), ensuring these pillars remain linked.</li>
+              </ul>
+
+              <h4 className="font-medium">How We Will Get There</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Provide a SaaS offering with monthly subscriptions so users have continuous access to iterative strategy development.</li>
+                <li>Integrate strategy, metrics, and finances in one platform, ensuring that changes in financial assumptions automatically reflect in strategic objectives and vice versa.</li>
+                <li>Offer premium consulting services for deeper engagements, especially where more customization and strategic insight is required by founders and VCs.</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">2. Vision, Mission & Business Goals</h3>
+              <h4 className="font-medium">Vision</h4>
+              <p className="mb-4">To become the industry-standard AI tool that redefines strategic planning by seamlessly integrating systems thinking, strategy formulation, financial projection and operational metrics — guiding both startups and their investors towards resilience, alignment and data‐driven success.</p>
+
+              <h4 className="font-medium">Mission</h4>
+              <p className="mb-4">We enable and empower startups and VCs to adapt swiftly and align their strategic decisions, action plans (OKRs), and financial projections in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is coherent, evidence‐based, and future‐resilient.</p>
+
+              <h4 className="font-medium">Business Goals</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Profit Every Year: Reach operational profitability for NEO within 2 years and contribute significantly to overall revenue growth. Avoid negative net margins by aligning staff expansion and R&D with actual MRR.</li>
+                <li>Continuous growth in profit: continuous growth in profit margins and net profit with digital products.</li>
+                <li>Productivity gains: Demonstrate a 50% reduction in planning cycle times for users compared to traditional methods.</li>
+                <li>NPS score: Attain a customer satisfaction rating of over 90% within the first 18 months.</li>
+                <li>Market Penetration: Achieve market penetration in the strategic planning software space by capturing at least 20% of the target market within 3 years.</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">3. Diagnosis of the Challenge</h3>
+              <h4 className="font-medium">Root Problems</h4>
+              <ol className="list-decimal pl-5 mb-4">
+                <li className="mb-2">
+                  <strong>Integration Gap in Strategic Tools:</strong>
+                  <ul className="list-disc pl-5 mt-1">
+                    <li>Existing tools address either strategy formulation, financial projections, or OKRs in isolation</li>
+                    <li>No solution effectively unifies systems thinking, strategy, and financial modeling in one platform</li>
+                    <li>Organizations struggle with disconnected tools leading to strategic-financial misalignment</li>
+                  </ul>
+                </li>
+                <li className="mb-2">
+                  <strong>Market Adoption Barriers:</strong>
+                  <ul className="list-disc pl-5 mt-1">
+                    <li>Startups and SMEs are hesitant to adopt new strategic planning tools</li>
+                    <li>High customer education requirement as systems thinking is not widely understood</li>
+                    <li>Initial pricing resistance for an unproven but premium-positioned solution</li>
+                  </ul>
+                </li>
+                <li className="mb-2">
+                  <strong>Resource Constraints:</strong>
+                  <ul className="list-disc pl-5 mt-1">
+                    <li>Limited initial resources to simultaneously build robust product features, marketing presence, and support capabilities</li>
+                    <li>Challenge of balancing founder time between sales (pilot engagements), product development, and strategic partnerships</li>
+                    <li>Funding limitations requiring careful resource allocation without compromising quality</li>
+                  </ul>
+                </li>
+                <li className="mb-2">
+                  <strong>AI Integration Complexities:</strong>
+                  <ul className="list-disc pl-5 mt-1">
+                    <li>Technical challenge of ensuring consistent AI outputs across various strategy frameworks</li>
+                    <li>Potential model deprecation or changes could break core functionality</li>
+                    <li>Maintaining data security and privacy while leveraging AI capabilities</li>
+                  </ul>
+                </li>
+                <li className="mb-2">
+                  <strong>Competitive Differentiation:</strong>
+                  <ul className="list-disc pl-5 mt-1">
+                    <li>Risk of being perceived as "just another strategy tool" or "just another AI implementation"</li>
+                    <li>Need to establish clear value demonstration for different user segments (founders vs. VCs)</li>
+                    <li>Balancing depth of functionality with ease of use and implementation</li>
+                  </ul>
+                </li>
+              </ol>
+
+              <h4 className="font-medium">External Drivers</h4>
+              <div className="mb-6">
+                <p className="font-medium">Market & Technology Factors:</p>
+                <ul className="list-disc pl-5 mb-4">
+                  <li>Growing demand for real-time strategic insights amid economic uncertainty</li>
+                  <li>Increasing acceptance of AI-powered business tools</li>
+                  <li>Remote/distributed teams require centralized strategic collaboration</li>
+                  <li>Shift toward data-driven decision-making in strategy development</li>
+                </ul>
+
+                <p className="font-medium">Competitive Environment:</p>
+                <ul className="list-disc pl-5 mb-4">
+                  <li>Risk of established consulting firms developing similar digital offerings</li>
+                  <li>Potential for larger SaaS platforms to add strategic planning modules</li>
+                  <li>Emergence of specialized AI tools that address portions of the strategic planning process</li>
+                </ul>
+
+                <p className="font-medium">Regulatory & Security Considerations:</p>
+                <ul className="list-disc pl-5 mb-4">
+                  <li>Evolving AI regulations might impact how NEO processes and stores strategic data</li>
+                  <li>Data privacy concerns, especially with financial and strategic information</li>
+                  <li>Transparency requirements around AI-generated content and recommendations</li>
             </ul>
+              </div>
+
+              <h3 className="text-lg font-semibold mb-2">4. Where to Play (Market & Positioning Choices)</h3>
+              <h4 className="font-medium">Primary Segments</h4>
+              
+              <div className="mb-4">
+                <h5 className="font-medium">VC-Backed Startups (Growth Stage)</h5>
+                <p className="font-medium mt-2">Jobs to be Done:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Refine product-market fit and validate strategic direction while scaling</li>
+                  <li>Create consistent, investor-ready documentation that aligns strategy with financial projections</li>
+                  <li>Track KPIs and metrics that demonstrate growth and validate the business model</li>
+                  <li>Make data-driven decisions about pivoting or doubling down on current strategies</li>
+                  <li>Effectively communicate strategic changes and financial impacts to investors and board members</li>
+                  <li>Scale operations while preserving the agility and innovation that drove initial success</li>
+                </ul>
+
+                <p className="font-medium mt-2">Pains:</p>
+                <ul className="list-disc pl-5 mb-2">
+                  <li>Strategic misalignment between departments as company grows (60% fail due to poor strategy-execution alignment)</li>
+                  <li>Fragmented tools (Excel, Asana, QuickBooks) that don't synchronize, creating inconsistent data</li>
+                  <li>Reactive decision-making with manual scenario modeling taking weeks, delaying market responses</li>
+                  <li>Lack of real-time data to justify pivots to investors</li>
+                  <li>KPI/OKR confusion with teams tracking 50+ metrics without understanding which directly impact survival/growth</li>
+                  <li>Only 22% of employees can name their company's top 3 OKRs</li>
+                  <li>Scaling inefficiencies where rapid hiring/growth creates operational chaos</li>
+                  <li>Time-consuming investor reporting that feels disconnected from operational reality</li>
+                </ul>
+
+                <p className="font-medium mt-2">Gains:</p>
+                <ul className="list-disc pl-5 mb-4">
+                  <li>Reduced time to pivot from 6-9 months to 3 weeks</li>
+                  <li>Alignment between strategic decisions, OKRs, and financial projections</li>
+                  <li>Data-driven confidence in strategic decisions</li>
+                  <li>Clear visibility into which metrics truly impact growth and sustainability</li>
+                  <li>Ability to quickly model different scenarios and their financial implications</li>
+                  <li>Improved investor relations through consistent, transparent reporting</li>
+                  <li>Preserved culture and innovation during scaling</li>
+                </ul>
+              </div>
+
+              <h4 className="font-medium">Geographic Focus</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Start local (DACH region) for initial traction, expand globally via remote SaaS.</li>
+              </ul>
+
+              <h4 className="font-medium">Channels</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Direct Outreach to VC networks & accelerators.</li>
+                <li>Digital self‐serve signups for early‐stage founders.</li>
+                <li>LinkedIn and Website for marketing and sales</li>
+                <li>Partnerships with financial software or strategic consultancies for joint go‐to‐market.</li>
+              </ul>
+
+              <h4 className="font-medium">Market Positioning</h4>
+              <p className="mb-6">NEO is positioned as a cutting-edge, intelligent strategic partner—offering a unified platform that transforms complex strategic challenges into clear, actionable plans. Its value lies in its ability to reduce manual effort, speed up decision-making, and ensure continuous alignment between strategy and financial performance.</p>
+
+              <h3 className="text-lg font-semibold mb-2">5. How to Win (Competitive Advantage & Unique Value Proposition)</h3>
+              <h4 className="font-medium">Current Challenge in the Market</h4>
+              <p className="mb-4">Traditional strategy development is fragmented, static, and lacks integration between strategic vision and financial realities. Business management tools exist in silos. Companies use one tool for strategic planning, another for financial modeling, a third for OKRs, and nothing connects them. When market conditions change, updating all these elements becomes time-consuming and error-prone due to human intervention.</p>
+
+              <p className="mb-4">In short, current strategy tools are either:</p>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Too theoretical (strategy frameworks without implementation guidance)</li>
+                <li>Too tactical (financial spreadsheets without strategic context)</li>
+                <li>Too rigid (templates that don't adapt to business evolution)</li>
+                <li>Too fragmented (separate tools for strategy, finance, and execution)</li>
+              </ul>
+
+              <h4 className="font-medium">NEO's Proprietary AI Solution</h4>
+              <p className="mb-2">NEO's AI approach is uniquely powerful because:</p>
+              <ol className="list-decimal pl-5 mb-4">
+                <li>Synchronized Systems Architecture: Our proprietary document synchronization engine ensures any change in one strategic element automatically triggers intelligent updates across all other documents.</li>
+                <li>Strategy-Finance Integration Algorithm: We've developed a specialized AI model that translates strategic decisions directly into financial implications and vice versa.</li>
+                <li>Adaptive Strategy Evolution Engine: Our unique AI capability learns from strategy implementation data, creating a continuous improvement cycle.</li>
+                <li>Dynamic Strategy Canvas: Unlike static business model canvases, our Dynamic Strategy Canvas continuously evolves as the business learns and market conditions change.</li>
+                <li>Investor-Ready Outputs: NEO produces professional-quality outputs specifically designed to appeal to venture capital firms.</li>
+                <li>AI-Powered Scenario Planning: NEO generates multidimensional scenario analyses based on key assumptions.</li>
+                <li>Implementation-First Approach: NEO bridges the strategy-execution gap by converting strategic intentions directly into actionable OKRs.</li>
+                <li>Continuous Adaptation Framework: NEO ensures strategies evolve based on market feedback and performance data.</li>
+                <li>End-to-End Strategy Integration: NEO seamlessly connects strategy formulation, financial projection, and execution tracking.</li>
+              </ol>
+
+              <h3 className="text-lg font-semibold mb-2">6. Guiding Policy (Strategic Principles & Trade‐offs)</h3>
+              <h4 className="font-medium">Strategic Principles:</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Focus on Integration: Always align strategy with financial and operational realities.</li>
+                <li>Embrace Systems Thinking: Use holistic analysis and feedback loops.</li>
+                <li>Prioritize Customer Success: Design solutions that ensure long-term customer retention.</li>
+                <li>Agile Adaptation: Be prepared to pivot based on real-time data.</li>
+                <li>Monitor monthly net margin: Phase in expenses gradually to maintain profitability.</li>
+                <li>Carefully monitor OPEX: Restrict expansions to avoid overspending.</li>
+                <li>Preserve a Minimal Marketing Budget: Focus on word of mouth and inbound content.</li>
+                <li>Slight price premium: Justify higher monthly fees with unique value proposition.</li>
+                <li>Emphasize Premium Value: Maintain identity as a "close, personalized" solution.</li>
+                <li>Limit consulting or implement standardized packages.</li>
+              </ul>
+
+              <h4 className="font-medium">Trade-offs:</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Prioritize long-term strategic alignment over short-term revenue gains.</li>
+                <li>Invest in robust, scalable technology even if initial costs are higher.</li>
+                <li>Focus on depth of service and simplicity rather than generic solutions.</li>
+                <li>Deliver simple but functional solutions for small businesses.</li>
+                <li>Ensure high quality content rather than new features.</li>
+                <li>Won't chase hyper‐scaling or huge marketing blasts.</li>
+                <li>Won't overspend in fear of being overrun.</li>
+                <li>Won't drastically discount to gain mass users.</li>
+                <li>Not a free or low‐end financial tool.</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">7. Key Strategic Priorities & Focus Areas</h3>
+              <h4 className="font-medium">Product Development & Innovation:</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Continuously iterate the user interface for a seamless experience.</li>
+                <li>Ongoing, user‐driven improvements.</li>
+                <li>Enhance AI capabilities in systems thinking and financial forecasting.</li>
+              </ul>
+
+              <h4 className="font-medium">Market Expansion & Customer Acquisition:</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Target early adopters in the startup ecosystem.</li>
+                <li>Develop robust digital marketing and thought leadership.</li>
+                <li>Predefined annual marketing budget for content and community.</li>
+                <li>Build relationships with VCs and growth‐stage startups.</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">8. Execution Plan (Coherent Actions & Resource Allocation)</h3>
+              <h4 className="font-medium">Phase 1 (0–6 Months)</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>MVP with essential synergy features</li>
+                <li>Secure 10–15 pilot customers</li>
+                <li>Gather feedback for improvement</li>
+                <li>Initiate digital marketing campaigns</li>
+              </ul>
+
+              <h4 className="font-medium">Phase 2 (6–12 Months)</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Lean R&D expansions</li>
+                <li>Expand subscription tiers</li>
+                <li>Expand brand presence</li>
+                <li>Build a small team for support</li>
+              </ul>
+
+              <h4 className="font-medium">Phase 3 (Year 2+)</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Staff additions based on MRR thresholds</li>
+                <li>Implement "client cap" or waitlist</li>
+                <li>Evaluate global expansions</li>
+                <li>Introduce additional modules</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">9. Risk Management & Resilience</h3>
+              <h4 className="font-medium">Key Risks</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Market Acceptance Risk: Resistance to new tools</li>
+                <li>Competitive Risk: Larger players replicating features</li>
+                <li>Scaling Risk: Growth straining support</li>
+                <li>Churn Risk: Failure to deliver continuous value</li>
+                <li>Market Acceptance: Heavy reliance on digital offerings</li>
+                <li>Limited Consulting: Digital uptake challenges</li>
+                <li>Competitive Pressure: Larger marketing budgets</li>
+                <li>Tax & Regulatory Changes: Policy shifts</li>
+              </ul>
+
+              <h4 className="font-medium">Mitigation Strategies</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Seamless onboarding and early feedback loops</li>
+                <li>Targeted content and community building</li>
+                <li>Modular, high-margin packages</li>
+                <li>Continuous differentiation</li>
+                <li>Strong user engagement and retention</li>
+                <li>Buffer & scenario planning</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">10. Performance Metrics & Success Measures</h3>
+              <h4 className="font-medium">Leading Indicators</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Monthly Churn Rate below 5%</li>
+                <li>New Startup Signups/Month from referrals</li>
+                <li>Partnership Conversions</li>
+                <li>Net Profit remaining positive</li>
+                <li>Monthly Recurring Revenue (MRR)</li>
+              </ul>
+
+              <h4 className="font-medium">Lagging Indicators</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>MRR Growth per quarter</li>
+                <li>Net Promoter Score (NPS)</li>
+                <li>Consulting Revenue ratio</li>
+                <li>Team Growth based on MRR</li>
+              </ul>
+
+              <h4 className="font-medium">Review Cadence</h4>
+              <ul className="list-disc pl-5 mb-6">
+                <li>Monthly: Evaluate metrics and patterns</li>
+                <li>Quarterly: Strategic updates and pivots</li>
+              </ul>
+
+              <h3 className="text-lg font-semibold mb-2">11. Long-Term Sustainability & Evolution</h3>
+              <h4 className="font-medium">Sustainability Strategy</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Invest in continuous R&D</li>
+                <li>Cultivate innovation culture</li>
+                <li>Expand service ecosystem</li>
+              </ul>
+
+              <h4 className="font-medium">Evolution Strategy</h4>
+              <ul className="list-disc pl-5 mb-4">
+                <li>Regular strategic framework updates</li>
+                <li>Foster strategic partnerships</li>
+                <li>Balance efficiency with growth</li>
+              </ul>
+            </div>
           </div>
         ),
         'Financial Projection': (
           <div className="p-4">
-            <h2 className="text-xl font-bold mb-4">Financial Projection - NEO</h2>
-            <div className="mb-4">
-              <h3 className="text-lg font-semibold mb-2">Revenue Streams</h3>
-              <table className="min-w-full border">
+            <h2 className="text-xl font-bold mb-4">NEO Financial Projections (5-Year Plan)</h2>
+            <div className="prose prose-sm max-w-none">
+              <div className="overflow-x-auto">
+                <table className="min-w-full border-collapse border border-gray-300 mb-6">
                 <thead>
-                  <tr>
-                    <th className="border p-2">Subscription Tier</th>
-                    <th className="border p-2">Price</th>
-                    <th className="border p-2">Year 1 Target</th>
+                    <tr className="bg-gray-100">
+                      <th className="border border-gray-300 p-2">Category</th>
+                      <th className="border border-gray-300 p-2">Q1</th>
+                      <th className="border border-gray-300 p-2">Q2</th>
+                      <th className="border border-gray-300 p-2">Q3</th>
+                      <th className="border border-gray-300 p-2">Q4</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr>
-                    <td className="border p-2">Basic</td>
-                    <td className="border p-2">€49/mo</td>
-                    <td className="border p-2">180 subscribers</td>
+                    {/* Revenue Section */}
+                    <tr className="bg-blue-50 font-semibold">
+                      <td colSpan={5} className="border border-gray-300 p-2">Revenue</td>
+                    </tr>
+                    <tr>
+                      <td className="border border-gray-300 p-2">Basic Subscriptions</td>
+                      <td className="border border-gray-300 p-2">€2,450</td>
+                      <td className="border border-gray-300 p-2">€4,900</td>
+                      <td className="border border-gray-300 p-2">€7,350</td>
+                      <td className="border border-gray-300 p-2">€9,800</td>
                   </tr>
                   <tr>
-                    <td className="border p-2">Pro</td>
-                    <td className="border p-2">€99/mo</td>
-                    <td className="border p-2">90 subscribers</td>
+                      <td className="border border-gray-300 p-2">Pro Subscriptions</td>
+                      <td className="border border-gray-300 p-2">€2,970</td>
+                      <td className="border border-gray-300 p-2">€5,940</td>
+                      <td className="border border-gray-300 p-2">€8,910</td>
+                      <td className="border border-gray-300 p-2">€11,880</td>
                   </tr>
                   <tr>
-                    <td className="border p-2">Enterprise</td>
-                    <td className="border p-2">€299/mo</td>
-                    <td className="border p-2">30 subscribers</td>
+                      <td className="border border-gray-300 p-2">Enterprise Subscriptions</td>
+                      <td className="border border-gray-300 p-2">€2,990</td>
+                      <td className="border border-gray-300 p-2">€5,980</td>
+                      <td className="border border-gray-300 p-2">€8,970</td>
+                      <td className="border border-gray-300 p-2">€11,960</td>
+                    </tr>
+                    <tr>
+                      <td className="border border-gray-300 p-2">Pilot Projects</td>
+                      <td className="border border-gray-300 p-2">€15,000</td>
+                      <td className="border border-gray-300 p-2">€20,000</td>
+                      <td className="border border-gray-300 p-2">€25,000</td>
+                      <td className="border border-gray-300 p-2">€30,000</td>
+                    </tr>
+                    <tr className="bg-green-50 font-semibold">
+                      <td className="border border-gray-300 p-2">Total Revenue</td>
+                      <td className="border border-gray-300 p-2">€23,410</td>
+                      <td className="border border-gray-300 p-2">€36,820</td>
+                      <td className="border border-gray-300 p-2">€50,230</td>
+                      <td className="border border-gray-300 p-2">€63,640</td>
+                    </tr>
+
+                    {/* Expenses Section */}
+                    <tr className="bg-red-50 font-semibold">
+                      <td colSpan={5} className="border border-gray-300 p-2">Operating Expenses</td>
+                    </tr>
+                    <tr>
+                      <td className="border border-gray-300 p-2">Infrastructure Costs</td>
+                      <td className="border border-gray-300 p-2">€2,500</td>
+                      <td className="border border-gray-300 p-2">€3,000</td>
+                      <td className="border border-gray-300 p-2">€3,500</td>
+                      <td className="border border-gray-300 p-2">€4,000</td>
+                    </tr>
+                    <tr>
+                      <td className="border border-gray-300 p-2">Marketing & Sales</td>
+                      <td className="border border-gray-300 p-2">€5,000</td>
+                      <td className="border border-gray-300 p-2">€6,000</td>
+                      <td className="border border-gray-300 p-2">€7,000</td>
+                      <td className="border border-gray-300 p-2">€8,000</td>
+                    </tr>
+                    <tr>
+                      <td className="border border-gray-300 p-2">Development</td>
+                      <td className="border border-gray-300 p-2">€8,000</td>
+                      <td className="border border-gray-300 p-2">€10,000</td>
+                      <td className="border border-gray-300 p-2">€12,000</td>
+                      <td className="border border-gray-300 p-2">€15,000</td>
+                    </tr>
+                    <tr className="bg-red-50 font-semibold">
+                      <td className="border border-gray-300 p-2">Total Expenses</td>
+                      <td className="border border-gray-300 p-2">€15,500</td>
+                      <td className="border border-gray-300 p-2">€19,000</td>
+                      <td className="border border-gray-300 p-2">€22,500</td>
+                      <td className="border border-gray-300 p-2">€27,000</td>
+                    </tr>
+
+                    {/* Net Profit Section */}
+                    <tr className="bg-purple-50 font-semibold">
+                      <td className="border border-gray-300 p-2">Net Profit</td>
+                      <td className="border border-gray-300 p-2">€7,910</td>
+                      <td className="border border-gray-300 p-2">€17,820</td>
+                      <td className="border border-gray-300 p-2">€27,730</td>
+                      <td className="border border-gray-300 p-2">€36,640</td>
                   </tr>
                 </tbody>
               </table>
+
+                {/* Key Metrics and Analysis */}
+                <div className="mt-8">
+                  <h3 className="text-lg font-semibold mb-4">Key Financial Metrics & Analysis</h3>
+                  
+                  <div className="grid grid-cols-2 gap-6">
+                    <div className="bg-blue-50 p-4 rounded">
+                      <h4 className="font-medium mb-2">Revenue Growth</h4>
+                      <ul className="list-disc pl-5">
+                        <li>Q1 to Q2: 57.3% growth</li>
+                        <li>Q2 to Q3: 36.4% growth</li>
+                        <li>Q3 to Q4: 26.7% growth</li>
+                        <li>Projected Annual Revenue: €174,100</li>
+                      </ul>
             </div>
-            <div className="mb-4">
-              <h3 className="text-lg font-semibold mb-2">Pilot Engagements</h3>
-              <p>8-10 pilot deals at €5-10k each = €60-80k additional revenue</p>
+
+                    <div className="bg-green-50 p-4 rounded">
+                      <h4 className="font-medium mb-2">Profitability Metrics</h4>
+                      <ul className="list-disc pl-5">
+                        <li>Average Quarterly Profit Margin: 45.2%</li>
+                        <li>Q4 Profit Margin: 57.6%</li>
+                        <li>Total Annual Profit: €90,100</li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 bg-yellow-50 p-4 rounded">
+                    <h4 className="font-medium mb-2">Key Observations</h4>
+                    <ul className="list-disc pl-5">
+                      <li>Strong revenue growth from subscription model</li>
+                      <li>Pilot projects contribute significantly to revenue</li>
+                      <li>Controlled expense growth maintains profitability</li>
+                      <li>Healthy profit margins indicate sustainable business model</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         ),
         OKRs: (
           <div className="p-4">
-            <h2 className="text-xl font-bold mb-4">OKRs - NEO</h2>
-            
-            <div className="mb-4">
+            <h2 className="text-xl font-bold mb-4">NEO – Objectives and Key Results derived from Strategy</h2>
+            <div className="prose prose-sm max-w-none">
+              {/* Objective 1 */}
+              <div className="mb-8 bg-blue-50 p-4 rounded">
               <h3 className="text-lg font-semibold mb-2">Objective 1: Achieve €100K in Total First-Year Revenue</h3>
-              <p className="italic mb-2">Rationale: Secure short-term financial viability, build investor confidence, and lay the foundation for scaling.</p>
-              <ul className="list-disc pl-5">
-                <li>KR1: Generate a minimum of €8,300 in Monthly Recurring Revenue (MRR) by Month 12.</li>
-                <li>KR2: Close at least 8 high-ticket pilot engagements or consulting deals (≥ €5,000 each) within Year 1.</li>
-                <li>KR3: Convert at least 40% of new signups to Pro (€99/mo) or Enterprise (€299/mo) tiers on an annual plan.</li>
-              </ul>
+                <p className="italic mb-3">Rationale: Secure short-term financial viability, build investor confidence, and lay the foundation for scaling.</p>
+                <h4 className="font-medium mb-2">Key Results</h4>
+                <ol className="list-decimal pl-5">
+                  <li>Generate a minimum of €8,300 in Monthly Recurring Revenue (MRR) by Month 12.</li>
+                  <li>Close at least 8 high-ticket pilot engagements or consulting deals (≥ €5,000 each) within Year 1.</li>
+                  <li>Convert at least 40% of new signups to Pro (€99/mo) or Enterprise (€299/mo) tiers on an annual plan.</li>
+                  <li>Maintain an average 30-day sales cycle (from lead to closed deal) or less for B2B pilot offerings.</li>
+                  <li>Achieve an average revenue per user (ARPU) of at least €80 across all paying subscribers in Year 1.</li>
+                </ol>
             </div>
             
-            <div className="mb-4">
+              {/* Objective 2 */}
+              <div className="mb-8 bg-green-50 p-4 rounded">
               <h3 className="text-lg font-semibold mb-2">Objective 2: Grow Subscription Base & Reduce Churn</h3>
-              <p className="italic mb-2">Rationale: Establish strong, recurring subscription income and foster stable user retention, particularly for high-value tiers.</p>
-              <ul className="list-disc pl-5">
-                <li>KR1: Reach 300 total paying subscribers by end of Year 1 (across all tiers).</li>
-                <li>KR2: Maintain a monthly churn rate below 5% after the first 3 months of launch.</li>
-                <li>KR3: Attain ≥ 40% of subscribers on Pro or Enterprise plans within 6 months.</li>
-              </ul>
+                <p className="italic mb-3">Rationale: Establish strong, recurring subscription income and foster stable user retention, particularly for high-value tiers.</p>
+                <h4 className="font-medium mb-2">Key Results</h4>
+                <ol className="list-decimal pl-5">
+                  <li>Reach 300 total paying subscribers by end of Year 1 (across all tiers).</li>
+                  <li>Maintain a monthly churn rate below 5% after the first 3 months of launch.</li>
+                  <li>Attain ≥ 40% of subscribers on Pro or Enterprise plans within 6 months.</li>
+                  <li>Achieve ≥ 20% subscription upgrades (e.g., from Basic to Pro or Enterprise) by end of Year 1.</li>
+                  <li>Limit free trial to paid conversion time to a median of 10 days or fewer.</li>
+                </ol>
+              </div>
+
+              {/* Objective 3 */}
+              <div className="mb-8 bg-purple-50 p-4 rounded">
+                <h3 className="text-lg font-semibold mb-2">Objective 3: Deliver Exceptional Customer Satisfaction & ROI</h3>
+                <p className="italic mb-3">Rationale: Differentiate NEO through quality user experience, robust strategic insights, and clear value—driving long-term loyalty and word-of-mouth.</p>
+                <h4 className="font-medium mb-2">Key Results</h4>
+                <ol className="list-decimal pl-5">
+                  <li>Maintain a Customer Satisfaction Score ≥ 90% across all paying tiers (via quarterly surveys).</li>
+                  <li>Attain an NPS (Net Promoter Score) ≥ 50 by Year 1, indicating strong brand advocacy.</li>
+                  <li>Log at least 10 verified ROI case studies (e.g., cost savings, revenue growth, successful pivots) from Pro/Enterprise clients.</li>
+                  <li>Time-to-Value under 14 days for new signups—measure how quickly new users complete a meaningful strategic/financial scenario.</li>
+                  <li>Achieve a &lt;24-hour average response time for Enterprise-tier support tickets (and &lt;48 hours for all tiers).</li>
+                </ol>
+              </div>
+
+              {/* Objective 4 */}
+              <div className="mb-8 bg-yellow-50 p-4 rounded">
+                <h3 className="text-lg font-semibold mb-2">Objective 4: Strengthen Market Presence & Channel Partnerships</h3>
+                <p className="italic mb-3">Rationale: Leverage strategic alliances and targeted marketing to efficiently attract leads who can afford higher-tier subscriptions.</p>
+                <h4 className="font-medium mb-2">Key Results</h4>
+                <ol className="list-decimal pl-5">
+                  <li>Establish 2–3 formal accelerator or VC network partnerships that onboard at least 50 total Basic/Pro subscribers within the first 6 months.</li>
+                  <li>Generate more than 1,000 qualified leads from LinkedIn Ads, webinars, and direct outreach by the end of Year 1.</li>
+                  <li>Host a bi-weekly "NEO Live Demo" webinar with an average of 50+ attendees each, converting at least 10% to paying subscribers.</li>
+                  <li>Secure 5 external blog posts or press mentions highlighting NEO's unique AI-driven strategy + finance approach.</li>
+                  <li>Participate as a speaker or sponsor in 3 industry events or startup conferences, building brand credibility.</li>
+                </ol>
+              </div>
+
+              {/* Objective 5 */}
+              <div className="mb-8 bg-red-50 p-4 rounded">
+                <h3 className="text-lg font-semibold mb-2">Objective 5: Rapid Product & AI Enhancement Aligned with User Needs</h3>
+                <p className="italic mb-3">Rationale: Continuously evolve NEO's capabilities to retain competitive edge, especially at premium price points.</p>
+                <h4 className="font-medium mb-2">Key Results</h4>
+                <ol className="list-decimal pl-5">
+                  <li>Implement 5 top-voted feature requests from Enterprise tier clients each quarter, ensuring high perceived value at €299/mo.</li>
+                  <li>Release 2 major AI improvements (e.g., advanced scenario planning or deeper financial modeling modules) within the first 9 months.</li>
+                  <li>Maintain a monthly product iteration cycle—each iteration addresses at least 1 critical user feedback item from the pilot or Pro/Enterprise customers.</li>
+                  <li>Achieve a product uptime of 99.9% and keep bug resolution time under 72 hours on average.</li>
+                  <li>Conduct quarterly user-experience audits, ensuring that key workflows require ≤ 3 clicks to reach the main strategic or financial outcome screens.</li>
+                </ol>
+              </div>
+
+              {/* Objective 6 */}
+              <div className="mb-8 bg-indigo-50 p-4 rounded">
+                <h3 className="text-lg font-semibold mb-2">Objective 6: Operational Efficiency & Resource Allocation</h3>
+                <p className="italic mb-3">Rationale: Ensure stable internal processes despite rapid customer expansion and rising demands on support or custom engagements.</p>
+                <h4 className="font-medium mb-2">Key Results</h4>
+                <ol className="list-decimal pl-5">
+                  <li>Dedicate ≥ 30% of your weekly schedule to direct sales and pilot‐engagement calls, ensuring pipeline momentum.</li>
+                  <li>Onboard 1–2 reliable freelancers/contractors for either marketing or development by Month 6, freeing up founder time for high-value tasks.</li>
+                  <li>Keep monthly burn rate under €X (appropriate for your budget constraints) while maintaining planned OPEX for growth.</li>
+                  <li>Maintain a 3-month runway of operating cash in the bank at all times.</li>
+                  <li>Achieve a funnel conversion rate (from leads to paying customers) of ≥ 10% across all digital channels.</li>
+                </ol>
+              </div>
             </div>
           </div>
         )
@@ -583,19 +2262,19 @@ Please start by sharing your goals and vision.`
         <h3 className="text-lg font-semibold mb-2">Vision & Goals</h3>
         <div className="mb-4 bg-blue-50 p-3 rounded">
           <p className="mb-2">{goals}</p>
-        </div>
+      </div>
         
         <h3 className="text-lg font-semibold mb-2">Market Analysis</h3>
         <div className="grid grid-cols-2 gap-4 mb-4">
           <div className="bg-red-50 p-3 rounded">
             <h4 className="font-medium mb-2">Challenges</h4>
             <p>{challenges}</p>
-          </div>
+        </div>
           <div className="bg-green-50 p-3 rounded">
             <h4 className="font-medium mb-2">Opportunities</h4>
             <p>{opportunities}</p>
-          </div>
         </div>
+      </div>
         
         <h3 className="text-lg font-semibold mb-2">Value Proposition</h3>
         <div className="mb-4 bg-purple-50 p-3 rounded">
@@ -627,766 +2306,7 @@ Please start by sharing your goals and vision.`
     
     // Set success message
     setSuccessMessage("Strategy document created successfully!");
-    setTimeout(() => setSuccessMessage(null), 3000);
-  };
-
-  // Convert various file types to JSON
-  const convertFileToJson = async (file: File, docType: string): Promise<any> => {
-    if (!isClient) return null;
-    
-    const fileExtension = file.name.split('.').pop()?.toLowerCase();
-    
-    try {
-      // CSV files
-      if (fileExtension === 'csv') {
-        return new Promise((resolve, reject) => {
-          // @ts-ignore - Papa is imported dynamically
-          Papa.parse(file, {
-            header: true,
-            dynamicTyping: true,
-            complete: (results: any) => {
-              resolve({
-                type: docType,
-                format: 'csv',
-                fileName: file.name,
-                data: results.data,
-                meta: results.meta,
-                lastModified: new Date().toISOString()
-              });
-            },
-            error: (error: any) => {
-              reject(error);
-            }
-          });
-        });
-      }
-      
-      // Excel files
-      else if (['xlsx', 'xls'].includes(fileExtension || '')) {
-        const arrayBuffer = await file.arrayBuffer();
-        // @ts-ignore - XLSX is imported dynamically
-        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
-        
-        // Convert to JSON
-        const firstSheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[firstSheetName];
-        // @ts-ignore - XLSX is imported dynamically
-        const data = XLSX.utils.sheet_to_json(worksheet);
-        
-        return {
-          type: docType,
-          format: 'excel',
-          fileName: file.name,
-          sheetName: firstSheetName,
-          data: data,
-          lastModified: new Date().toISOString()
-        };
-      }
-      
-      // Word documents
-      else if (['docx', 'doc'].includes(fileExtension || '')) {
-        const arrayBuffer = await file.arrayBuffer();
-        // @ts-ignore - mammoth is imported dynamically
-        const result = await mammoth.extractRawText({ arrayBuffer });
-        
-        return {
-          type: docType,
-          format: 'word',
-          fileName: file.name,
-          content: result.value,
-          lastModified: new Date().toISOString()
-        };
-      }
-      
-      // JSON files
-      else if (fileExtension === 'json') {
-        const text = await file.text();
-        const data = JSON.parse(text);
-        
-        return {
-          type: docType,
-          format: 'json',
-          fileName: file.name,
-          data: data,
-          lastModified: new Date().toISOString()
-        };
-      }
-      
-      // Text files
-      else if (['txt', 'md'].includes(fileExtension || '')) {
-        const text = await file.text();
-        
-        return {
-          type: docType,
-          format: 'text',
-          fileName: file.name,
-          content: text,
-          lastModified: new Date().toISOString()
-        };
-      }
-      
-      // Fallback for other file types
-      else {
-        const text = await file.text();
-        
-        return {
-          type: docType,
-          format: 'unknown',
-          fileName: file.name,
-          content: text,
-          lastModified: new Date().toISOString()
-        };
-      }
-    } catch (error) {
-      console.error('Error converting file to JSON:', error);
-      throw error;
-    }
-  };
-
-  // File upload handlers
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      processUploadedFile(files[0]);
-    }
-  };
-
-  const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-      processUploadedFile(files[0]);
-    }
-  };
-
-  // Save JSON to "filesystem" (localStorage for prototype)
-  const saveJsonToFileSystem = (jsonData: any, fileName: string) => {
-    if (!isClient) return null;
-    
-    try {
-      // Create directory structure if it doesn't exist
-      if (!localStorage.getItem('neoFileSystem')) {
-        localStorage.setItem('neoFileSystem', JSON.stringify({}));
-      }
-      
-      const fileSystem = JSON.parse(localStorage.getItem('neoFileSystem') || '{}');
-      const filePath = `${storageDirectory ? storageDirectory + '/' : ''}${fileName}`;
-      
-      // Store the file in our simulated filesystem
-      fileSystem[filePath] = {
-        content: jsonData,
-        lastModified: new Date().toISOString()
-      };
-      
-      localStorage.setItem('neoFileSystem', JSON.stringify(fileSystem));
-      
-      // Also create an actual downloadable file
-      const json = JSON.stringify(jsonData, null, 2);
-      const blob = new Blob([json], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      
-      // Create a downloadable link
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${fileName}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      
-      return filePath;
-    } catch (error) {
-      console.error('Error saving JSON to filesystem:', error);
-      throw error;
-    }
-  };
-
-  // Process an uploaded file
-  const processUploadedFile = async (file: File) => {
-    if (!isClient) return;
-    
-    try {
-      // Get selected document type
-      const docTypeSelect = document.querySelector('select') as HTMLSelectElement;
-      const docType = docTypeSelect ? docTypeSelect.value : 'Strategy Document';
-      
-      // Map the UI document type to the internal type
-      const docTypeMap: {[key: string]: string} = {
-        'Strategy Document': 'Strategy',
-        'Canvas': 'Canvas',
-        'OKRs': 'OKRs',
-        'Financial Projection': 'Financial Projection'
-      };
-      
-      const internalDocType = docTypeMap[docType] || 'Strategy';
-      
-      // Convert file to JSON
-      setSuccessMessage(`Converting ${file.name} to JSON format...`);
-      const jsonData = await convertFileToJson(file, internalDocType.toLowerCase());
-      
-      // Save to filesystem
-      setSuccessMessage(`Saving ${file.name} to filesystem...`);
-      const filePath = saveJsonToFileSystem(jsonData, `${internalDocType.toLowerCase()}_${file.name}`);
-      
-      // Create placeholder content for display
-      const placeholderContent = (
-        <div className="p-4">
-          <h2 className="text-xl font-bold mb-4">{internalDocType} - Imported from {file.name}</h2>
-          <p className="mb-4">File successfully imported and saved to: {filePath}</p>
-          <div className="p-4 bg-gray-100 rounded mb-4">
-            <p className="font-medium mb-2">File Details:</p>
-            <ul className="list-disc pl-5">
-              <li><strong>Format:</strong> {jsonData.format}</li>
-              <li><strong>Saved as:</strong> {filePath}</li>
-              <li><strong>Last Modified:</strong> {new Date().toLocaleString()}</li>
-            </ul>
-          </div>
-          <div className="p-4 bg-gray-100 rounded">
-            <p className="font-mono text-sm mb-2">Preview of JSON data:</p>
-            <div className="max-h-40 overflow-auto">
-              <pre className="font-mono text-xs whitespace-pre-wrap">
-                {JSON.stringify(jsonData, null, 2).substring(0, 500)}
-                {JSON.stringify(jsonData, null, 2).length > 500 ? '...' : ''}
-              </pre>
-            </div>
-          </div>
-        </div>
-      );
-      
-      // Update document content
-      setDocumentContent(prevContent => ({
-        ...prevContent,
-        [internalDocType]: placeholderContent
-      }));
-      
-      // Set hasDocuments to true since we now have at least one document
-      setHasDocuments(true);
-      
-      // Set active document to the one we just imported
-      setActiveDocument(internalDocType as DocumentType);
-      
-      // Show success message
-      setSuccessMessage(`Successfully imported ${file.name} as ${internalDocType} and saved to ${filePath}`);
       setTimeout(() => setSuccessMessage(null), 3000);
-      
-      // Close the modal
-      setShowIntegrationModal(false);
-    } catch (error) {
-      console.error('Error processing file:', error);
-      setSuccessMessage(`Error: Failed to process ${file.name}`);
-      setTimeout(() => setSuccessMessage(null), 3000);
-    }
-  };
-
-  // Function to implement suggested changes
-  const implementSuggestion = (suggestion: {id: string, text: string, implementationDetails: {section: string, action: string}}) => {
-    if (!isClient) return;
-    
-    const { section, action } = suggestion.implementationDetails;
-    
-    // Create standardized prompt for Claude
-    const standardizedPrompt = `
-  INSTRUCTION: Please implement the following change to maintain strategic coherence across documents.
-  
-  DOCUMENT TO MODIFY: ${section}
-  ACTION REQUIRED: ${action}
-  CONTEXT: This change is needed to ${suggestion.text.toLowerCase()}
-  
-  Please implement this change while maintaining alignment with all other strategic documents.
-  `;
-  
-    // Set the Claude prompt
-    setClaudePrompt(standardizedPrompt);
-    setPromptStage('pending');
-    
-    // Simulate sending to Claude and receiving response
-    setTimeout(() => {
-      // Update document content based on the suggestion
-      setDocumentContent(prevContent => {
-        const updatedContent = { ...prevContent };
-        
-        if (section === 'Strategy' && action === 'Add a "Key Strategic Priorities" section with customer acquisition channels') {
-          updatedContent.Strategy = (
-            <div className="p-4">
-              <h2 className="text-xl font-bold mb-4">Strategy Document - NEO</h2>
-              <h3 className="text-lg font-semibold mb-2">Vision</h3>
-              <p className="mb-4">To become the standard integrated platform that continuously aligns a company's strategic plan, financial projections, and operational metrics—guiding both startups and their investors towards sustainable, data-driven success.</p>
-              
-              <h3 className="text-lg font-semibold mb-2">Mission</h3>
-              <p className="mb-4">NEO empowers startups and VCs to jointly create, track, and adapt cohesive strategies in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is dynamic, evidence-based, and future-resilient.</p>
-              
-              <h3 className="text-lg font-semibold mb-2">Business Goals</h3>
-              <ul className="list-disc pl-5 mb-4">
-                <li>Profit Every Year: Reach operational profitability within 2 years</li>
-                <li>Continuous growth in profit margins and net profit</li>
-                <li>Demonstrate 50% reduction in planning cycle times for users</li>
-                <li>Attain customer satisfaction rating over 90% within 18 months</li>
-              </ul>
-              
-              <h3 className="text-lg font-semibold mb-2 bg-green-100 p-2">Key Strategic Priorities</h3>
-              <div className="pl-5 mb-4 bg-green-50 p-2">
-                <h4 className="font-medium">Customer Acquisition Channels</h4>
-                <ul className="list-disc pl-5">
-                  <li>Targeted LinkedIn Ads for startup founders / scale‐up CEOs</li>
-                  <li>Bi‐weekly NEO Live Demo Webinars</li>
-                  <li>Partnerships with 2-3 startup accelerators or VC networks</li>
-                  <li>Direct founder-led outreach to potential Enterprise clients</li>
-                  <li>Thought leadership content on strategy + systems thinking</li>
-                </ul>
-              </div>
-            </div>
-          );
-          
-          // Update inconsistency count for Strategy
-          setInconsistencyCount(prevCount => ({
-            ...prevCount,
-            'Strategy': Math.max(0, prevCount['Strategy'] - 1)
-          }));
-          
-          // Save changes to database if logged in
-          if (user) {
-            const htmlContent = `
-              <h2 class="text-xl font-bold mb-4">Strategy Document - NEO</h2>
-              <h3 class="text-lg font-semibold mb-2">Vision</h3>
-              <p class="mb-4">To become the standard integrated platform that continuously aligns a company's strategic plan, financial projections, and operational metrics—guiding both startups and their investors towards sustainable, data-driven success.</p>
-              
-              <h3 class="text-lg font-semibold mb-2">Mission</h3>
-              <p class="mb-4">NEO empowers startups and VCs to jointly create, track, and adapt cohesive strategies in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is dynamic, evidence-based, and future-resilient.</p>
-              
-              <h3 class="text-lg font-semibold mb-2">Business Goals</h3>
-              <ul class="list-disc pl-5 mb-4">
-                <li>Profit Every Year: Reach operational profitability within 2 years</li>
-                <li>Continuous growth in profit margins and net profit</li>
-                <li>Demonstrate 50% reduction in planning cycle times for users</li>
-                <li>Attain customer satisfaction rating over 90% within 18 months</li>
-              </ul>
-              
-              <h3 class="text-lg font-semibold mb-2">Key Strategic Priorities</h3>
-              <div class="pl-5 mb-4">
-                <h4 class="font-medium">Customer Acquisition Channels</h4>
-                <ul class="list-disc pl-5">
-                  <li>Targeted LinkedIn Ads for startup founders / scale‐up CEOs</li>
-                  <li>Bi‐weekly NEO Live Demo Webinars</li>
-                  <li>Partnerships with 2-3 startup accelerators or VC networks</li>
-                  <li>Direct founder-led outreach to potential Enterprise clients</li>
-                  <li>Thought leadership content on strategy + systems thinking</li>
-                </ul>
-              </div>
-            `;
-            
-            const rawContent = {
-              vision: "To become the standard integrated platform that continuously aligns a company's strategic plan, financial projections, and operational metrics—guiding both startups and their investors towards sustainable, data-driven success.",
-              mission: "NEO empowers startups and VCs to jointly create, track, and adapt cohesive strategies in real time. By merging systems thinking, strategy formulation, and financial modeling, we ensure every business decision is dynamic, evidence-based, and future-resilient.",
-              businessGoals: [
-                "Profit Every Year: Reach operational profitability within 2 years",
-                "Continuous growth in profit margins and net profit",
-                "Demonstrate 50% reduction in planning cycle times for users",
-                "Attain customer satisfaction rating over 90% within 18 months"
-              ],
-              strategicPriorities: {
-                customerAcquisition: [
-                  "Targeted LinkedIn Ads for startup founders / scale‐up CEOs",
-                  "Bi‐weekly NEO Live Demo Webinars",
-                  "Partnerships with 2-3 startup accelerators or VC networks",
-                  "Direct founder-led outreach to potential Enterprise clients",
-                  "Thought leadership content on strategy + systems thinking"
-                ]
-              }
-            };
-            
-            saveDocumentChanges('Strategy', htmlContent, rawContent);
-            recordImplementedSuggestion(suggestion.id, 'Strategy');
-          }
-        }
-        else if (section === 'OKRs' && action === 'Add customer satisfaction KR') {
-          updatedContent.OKRs = (
-            <div className="p-4">
-              <h2 className="text-xl font-bold mb-4">OKRs - NEO</h2>
-              
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold mb-2">Objective 1: Achieve €100K in Total First-Year Revenue</h3>
-                <p className="italic mb-2">Rationale: Secure short-term financial viability, build investor confidence, and lay the foundation for scaling.</p>
-                <ul className="list-disc pl-5">
-                  <li>KR1: Generate a minimum of €8,300 in Monthly Recurring Revenue (MRR) by Month 12.</li>
-                  <li>KR2: Close at least 8 high-ticket pilot engagements or consulting deals (≥ €5,000 each) within Year 1.</li>
-                  <li>KR3: Convert at least 40% of new signups to Pro (€99/mo) or Enterprise (€299/mo) tiers on an annual plan.</li>
-                </ul>
-              </div>
-              
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold mb-2">Objective 2: Grow Subscription Base & Reduce Churn</h3>
-                <p className="italic mb-2">Rationale: Establish strong, recurring subscription income and foster stable user retention, particularly for high-value tiers.</p>
-                <ul className="list-disc pl-5">
-                  <li>KR1: Reach 300 total paying subscribers by end of Year 1 (across all tiers).</li>
-                  <li>KR2: Maintain a monthly churn rate below 5% after the first 3 months of launch.</li>
-                  <li>KR3: Attain ≥ 40% of subscribers on Pro or Enterprise plans within 6 months.</li>
-                </ul>
-              </div>
-              
-              <div className="mb-4 bg-green-50 p-2">
-                <h3 className="text-lg font-semibold mb-2 bg-green-100 p-1">Objective 3: Deliver Exceptional Customer Satisfaction</h3>
-                <p className="italic mb-2">Rationale: Ensure high retention and word-of-mouth growth through superior user experience.</p>
-                <ul className="list-disc pl-5">
-                  <li className="bg-green-100">KR1: Achieve Customer Satisfaction Score ≥ 90% by Month 12 (aligned with Strategy Document)</li>
-                  <li className="bg-green-100">KR2: Attain a Net Promoter Score (NPS) ≥ 50 by Year 1</li>
-                  <li className="bg-green-100">KR3: Log at least 10 verified ROI case studies from Pro/Enterprise clients</li>
-                </ul>
-              </div>
-            </div>
-          );
-          
-          // Update inconsistency count
-          setInconsistencyCount(prevCount => ({
-            ...prevCount,
-            'OKRs': prevCount['OKRs'] - 1
-          }));
-          
-          // Save changes to database if logged in
-          if (user) {
-            const htmlContent = `
-              <h2 class="text-xl font-bold mb-4">OKRs - NEO</h2>
-              
-              <div class="mb-4">
-                <h3 class="text-lg font-semibold mb-2">Objective 1: Achieve €100K in Total First-Year Revenue</h3>
-                <p class="italic mb-2">Rationale: Secure short-term financial viability, build investor confidence, and lay the foundation for scaling.</p>
-                <ul class="list-disc pl-5">
-                  <li>KR1: Generate a minimum of €8,300 in Monthly Recurring Revenue (MRR) by Month 12.</li>
-                  <li>KR2: Close at least 8 high-ticket pilot engagements or consulting deals (≥ €5,000 each) within Year 1.</li>
-                  <li>KR3: Convert at least 40% of new signups to Pro (€99/mo) or Enterprise (€299/mo) tiers on an annual plan.</li>
-                </ul>
-              </div>
-              
-              <div class="mb-4">
-                <h3 class="text-lg font-semibold mb-2">Objective 2: Grow Subscription Base & Reduce Churn</h3>
-                <p class="italic mb-2">Rationale: Establish strong, recurring subscription income and foster stable user retention, particularly for high-value tiers.</p>
-                <ul class="list-disc pl-5">
-                  <li>KR1: Reach 300 total paying subscribers by end of Year 1 (across all tiers).</li>
-                  <li>KR2: Maintain a monthly churn rate below 5% after the first 3 months of launch.</li>
-                  <li>KR3: Attain ≥ 40% of subscribers on Pro or Enterprise plans within 6 months.</li>
-                </ul>
-              </div>
-              
-              <div class="mb-4">
-                <h3 class="text-lg font-semibold mb-2">Objective 3: Deliver Exceptional Customer Satisfaction</h3>
-                <p class="italic mb-2">Rationale: Ensure high retention and word-of-mouth growth through superior user experience.</p>
-                <ul class="list-disc pl-5">
-                  <li>KR1: Achieve Customer Satisfaction Score ≥ 90% by Month 12 (aligned with Strategy Document)</li>
-                  <li>KR2: Attain a Net Promoter Score (NPS) ≥ 50 by Year 1</li>
-                  <li>KR3: Log at least 10 verified ROI case studies from Pro/Enterprise clients</li>
-                </ul>
-              </div>
-            `;
-            
-            const rawContent = {
-              objectives: [
-                {
-                  title: "Achieve €100K in Total First-Year Revenue",
-                  rationale: "Secure short-term financial viability, build investor confidence, and lay the foundation for scaling.",
-                  keyResults: [
-                    "Generate a minimum of €8,300 in Monthly Recurring Revenue (MRR) by Month 12.",
-                    "Close at least 8 high-ticket pilot engagements or consulting deals (≥ €5,000 each) within Year 1.",
-                    "Convert at least 40% of new signups to Pro (€99/mo) or Enterprise (€299/mo) tiers on an annual plan."
-                  ]
-                },
-                {
-                  title: "Grow Subscription Base & Reduce Churn",
-                  rationale: "Establish strong, recurring subscription income and foster stable user retention, particularly for high-value tiers.",
-                  keyResults: [
-                    "Reach 300 total paying subscribers by end of Year 1 (across all tiers).",
-                    "Maintain a monthly churn rate below 5% after the first 3 months of launch.",
-                    "Attain ≥ 40% of subscribers on Pro or Enterprise plans within 6 months."
-                  ]
-                },
-                {
-                  title: "Deliver Exceptional Customer Satisfaction",
-                  rationale: "Ensure high retention and word-of-mouth growth through superior user experience.",
-                  keyResults: [
-                    "Achieve Customer Satisfaction Score ≥ 90% by Month 12 (aligned with Strategy Document)",
-                    "Attain a Net Promoter Score (NPS) ≥ 50 by Year 1",
-                    "Log at least 10 verified ROI case studies from Pro/Enterprise clients"
-                  ]
-                }
-              ]
-            };
-            
-            saveDocumentChanges('OKRs', htmlContent, rawContent);
-            recordImplementedSuggestion(suggestion.id, 'OKRs');
-          }
-        }
-        else if (section === 'Financial Projection' && action === 'Add sensitivity analysis section') {
-          updatedContent['Financial Projection'] = (
-            <div className="p-4">
-              <h2 className="text-xl font-bold mb-4">Financial Projection - NEO</h2>
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold mb-2">Revenue Streams</h3>
-                <table className="min-w-full border">
-                  <thead>
-                    <tr>
-                      <th className="border p-2">Subscription Tier</th>
-                      <th className="border p-2">Price</th>
-                      <th className="border p-2">Year 1 Target</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr>
-                      <td className="border p-2">Basic</td>
-                      <td className="border p-2">€49/mo</td>
-                      <td className="border p-2">180 subscribers</td>
-                    </tr>
-                    <tr>
-                      <td className="border p-2">Pro</td>
-                      <td className="border p-2">€99/mo</td>
-                      <td className="border p-2">90 subscribers</td>
-                    </tr>
-                    <tr>
-                      <td className="border p-2">Enterprise</td>
-                      <td className="border p-2">€299/mo</td>
-                      <td className="border p-2">30 subscribers</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold mb-2">Pilot Engagements</h3>
-                <p>8-10 pilot deals at €5-10k each = €60-80k additional revenue</p>
-              </div>
-              
-              <div className="mb-4 bg-green-50 p-2">
-                <h3 className="text-lg font-semibold mb-2 bg-green-100 p-1">Sensitivity Analysis</h3>
-                <p className="mb-2">Impact of different churn rates on Year 1 MRR:</p>
-                <table className="min-w-full border">
-                  <thead>
-                    <tr>
-                      <th className="border p-2">Scenario</th>
-                      <th className="border p-2">Monthly Churn</th>
-                      <th className="border p-2">Year-End MRR</th>
-                      <th className="border p-2">% of Target</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr>
-                      <td className="border p-2">Best Case</td>
-                      <td className="border p-2">2%</td>
-                      <td className="border p-2">€9,100</td>
-                      <td className="border p-2">110%</td>
-                    </tr>
-                    <tr>
-                      <td className="border p-2">Expected</td>
-                      <td className="border p-2">4%</td>
-                      <td className="border p-2">€8,300</td>
-                      <td className="border p-2">100%</td>
-                    </tr>
-                    <tr>
-                      <td className="border p-2">Worst Case</td>
-                      <td className="border p-2">7%</td>
-                      <td className="border p-2">€6,900</td>
-                      <td className="border p-2">83%</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          );
-          
-          // Save changes to database if logged in
-          if (user) {
-            const htmlContent = `
-              <h2 class="text-xl font-bold mb-4">Financial Projection - NEO</h2>
-              <div class="mb-4">
-                <h3 class="text-lg font-semibold mb-2">Revenue Streams</h3>
-                <table class="min-w-full border">
-                  <thead>
-                    <tr>
-                      <th class="border p-2">Subscription Tier</th>
-                      <th class="border p-2">Price</th>
-                      <th class="border p-2">Year 1 Target</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr>
-                      <td class="border p-2">Basic</td>
-                      <td class="border p-2">€49/mo</td>
-                      <td class="border p-2">180 subscribers</td>
-                    </tr>
-                    <tr>
-                      <td class="border p-2">Pro</td>
-                      <td class="border p-2">€99/mo</td>
-                      <td class="border p-2">90 subscribers</td>
-                    </tr>
-                    <tr>
-                      <td class="border p-2">Enterprise</td>
-                      <td class="border p-2">€299/mo</td>
-                      <td class="border p-2">30 subscribers</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div class="mb-4">
-                <h3 class="text-lg font-semibold mb-2">Pilot Engagements</h3>
-                <p>8-10 pilot deals at €5-10k each = €60-80k additional revenue</p>
-              </div>
-              
-              <div class="mb-4">
-                <h3 class="text-lg font-semibold mb-2">Sensitivity Analysis</h3>
-                <p class="mb-2">Impact of different churn rates on Year 1 MRR:</p>
-                <table class="min-w-full border">
-                  <thead>
-                    <tr>
-                      <th class="border p-2">Scenario</th>
-                      <th class="border p-2">Monthly Churn</th>
-                      <th class="border p-2">Year-End MRR</th>
-                      <th class="border p-2">% of Target</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr>
-                      <td class="border p-2">Best Case</td>
-                      <td class="border p-2">2%</td>
-                      <td class="border p-2">€9,100</td>
-                      <td class="border p-2">110%</td>
-                    </tr>
-                    <tr>
-                      <td class="border p-2">Expected</td>
-                      <td class="border p-2">4%</td>
-                      <td class="border p-2">€8,300</td>
-                      <td class="border p-2">100%</td>
-                    </tr>
-                    <tr>
-                      <td class="border p-2">Worst Case</td>
-                      <td class="border p-2">7%</td>
-                      <td class="border p-2">€6,900</td>
-                      <td class="border p-2">83%</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            `;
-            
-            const rawContent = {
-              revenue: {
-                subscriptions: [
-                  { tier: "Basic", price: 49, target: 180 },
-                  { tier: "Pro", price: 99, target: 90 },
-                  { tier: "Enterprise", price: 299, target: 30 }
-                ],
-                pilots: {
-                  count: "8-10",
-                  price: "€5-10k",
-                  total: "€60-80k"
-                }
-              },
-              sensitivityAnalysis: {
-                churnScenarios: [
-                  { scenario: "Best Case", churn: 0.02, mmr: 9100, percentOfTarget: 1.1 },
-                  { scenario: "Expected", churn: 0.04, mmr: 8300, percentOfTarget: 1.0 },
-                  { scenario: "Worst Case", churn: 0.07, mmr: 6900, percentOfTarget: 0.83 }
-                ]
-              }
-            };
-            
-            saveDocumentChanges('Financial Projection', htmlContent, rawContent);
-            recordImplementedSuggestion(suggestion.id, 'Financial Projection');
-          }
-        }
-        
-        return updatedContent;
-      });
-      
-      // Add Claude's response
-      const newResponse = {
-        id: claudeResponses.length + 1,
-        response: `I've implemented the suggested change to ${section}: ${action}. This maintains strategic coherence by ensuring alignment between your documents. The changes have been highlighted in green in the document.`
-      };
-      
-      setClaudeResponses([...claudeResponses, newResponse]);
-      
-      // Add to implemented suggestions
-      setImplementedSuggestions(prev => [...prev, suggestion.id]);
-      
-      // Show success message
-      setSuccessMessage(`Successfully implemented: ${suggestion.text}`);
-      setTimeout(() => setSuccessMessage(null), 3000);
-      
-      // Reset prompt stage
-      setPromptStage('completed');
-      setTimeout(() => setPromptStage('idle'), 2000);
-    }, 1500);
-  };
-
-  // Content for improvement suggestions based on active document
-  const improvementSuggestions: {[key: string]: Array<{id: string, text: string, implementationDetails: {section: string, action: string}}> } = {
-    Strategy: [
-      {
-        id: 'strategy-1',
-        text: 'Add specific customer acquisition channels in your strategy document',
-        implementationDetails: {
-          section: 'Strategy',
-          action: 'Add a "Key Strategic Priorities" section with customer acquisition channels'
-        }
-      },
-      {
-        id: 'strategy-2',
-        text: 'Include a clear competitive analysis to strengthen positioning',
-        implementationDetails: {
-          section: 'Strategy',
-          action: 'Add competitive analysis section'
-        }
-      }
-    ],
-    OKRs: [
-      {
-        id: 'okr-1',
-        text: 'Add customer satisfaction KR to match 90% target in Strategy Document',
-        implementationDetails: {
-          section: 'OKRs',
-          action: 'Add customer satisfaction KR'
-        }
-      },
-      {
-        id: 'okr-2',
-        text: 'Add product development milestones to better track execution',
-        implementationDetails: {
-          section: 'OKRs',
-          action: 'Add product development OKR'
-        }
-      }
-    ],
-    'Financial Projection': [
-      {
-        id: 'finance-1',
-        text: 'Include sensitivity analysis for different churn scenarios',
-        implementationDetails: {
-          section: 'Financial Projection',
-          action: 'Add sensitivity analysis section'
-        }
-      },
-      {
-        id: 'finance-2',
-        text: 'Revise MRR target to €7,000 for a more conservative approach',
-        implementationDetails: {
-          section: 'Financial Projection',
-          action: 'Adjust MRR target'
-        }
-      }
-    ],
-    Canvas: [
-      {
-        id: 'canvas-1',
-        text: 'Define specific acquisition strategies for 300 subscribers',
-        implementationDetails: {
-          section: 'Canvas',
-          action: 'Add acquisition strategies to Canvas'
-        }
-      },
-      {
-        id: 'canvas-2',
-        text: 'Add risk management section to address potential system traps',
-        implementationDetails: {
-          section: 'Canvas',
-          action: 'Add risk management section'
-        }
-      }
-    ]
   };
 
   // Function to handle submits
@@ -1433,7 +2353,7 @@ Please start by sharing your goals and vision.`
    - Why should customers choose you over alternatives?
    - What specific benefits do you deliver?`;
           break;
-        
+          
         case 4: // After Value Proposition
           nextResponse = "Thank you for all this valuable information. I'm now generating your strategy document that brings all these elements together coherently.";
           // Generate strategy documents
@@ -1471,18 +2391,30 @@ Please start by sharing your goals and vision.`
   };
 
   // Settings modal handler
-  const handleSaveSettings = (directory: string) => {
+  const handleSaveSettings = async (directory: string) => {
     if (!isClient) return;
     
     setStorageDirectory(directory);
     localStorage.setItem('neoStorageDirectory', directory);
+    
     setShowSettingsModal(false);
-    setSuccessMessage('Settings saved successfully');
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
   // Update inconsistency count when suggestions are implemented
   useEffect(() => {
+    // Only update inconsistency counts if there are assigned documents
+    const assignedDocuments = Object.entries(documentAssignments).filter(([_, path]) => path !== '');
+    if (assignedDocuments.length < 2) {
+      setInconsistencyCount({
+        'Canvas': 0,
+        'Strategy': 0,
+        'Financial Projection': 0,
+        'OKRs': 0
+      });
+      return;
+    }
+
     const newCounts: Record<DocumentType, number> = {
       'Canvas': 0,
       'Strategy': 0,
@@ -1498,7 +2430,7 @@ Please start by sharing your goals and vision.`
     });
 
     setInconsistencyCount(newCounts);
-  }, [implementedSuggestions, inconsistencies]);
+  }, [implementedSuggestions, inconsistencies, documentAssignments]);
 
   // Add this function near the top with other function declarations
   const scrollToBottom = () => {
@@ -1510,6 +2442,211 @@ Please start by sharing your goals and vision.`
     }, 100); // Small delay to ensure content is rendered
   };
 
+  // Modify the file selection handler
+  const handleFileSelect = async (file: FileData) => {
+    console.log('File selected:', file);
+    try {
+      // Save the document assignment
+      FileSystemService.setDocumentAssignment(file.docType, file.fullPath);
+      
+      // Update document assignments state
+      const newAssignments = {
+        ...documentAssignments,
+        [file.docType]: file.fullPath
+      };
+      setDocumentAssignments(newAssignments);
+      
+      // Save to localStorage
+      localStorage.setItem('neoDocumentAssignments', JSON.stringify(newAssignments));
+      
+      // Check for inconsistencies with new assignments
+      checkInconsistencies(newAssignments);
+      
+      if (file.docType === 'Strategy') {
+        const content = await FileSystemService.readFileContent(file);
+        console.log('File content loaded:', content);
+        // Update both strategyDocument and documentContent states
+        setStrategyDocument({
+          ...strategyDocument,
+          content: content
+        });
+        // Update the document content to display the loaded file
+        setDocumentContent(prevContent => ({
+          ...prevContent,
+          Strategy: (
+            <div className="p-4">
+              <h2 className="text-xl font-bold mb-4">Strategy Document</h2>
+              <div 
+                className="prose prose-sm max-w-none prose-headings:font-bold prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg prose-p:text-base prose-ul:list-disc prose-ul:pl-5 prose-li:text-base prose-strong:font-bold prose-em:italic prose-code:bg-gray-100 prose-code:px-1 prose-code:rounded"
+                dangerouslySetInnerHTML={{ __html: marked(content
+                  .replace(/[•>]/g, '') // Remove bullets and arrows
+                  .replace(/[|+=-]/g, '') // Remove box-drawing characters
+                  .replace(/\s+/g, ' ') // Normalize whitespace
+                  .replace(/[‐—]/g, '-') // Normalize dashes
+                  .replace(/['']/g, "'") // Normalize quotes
+                  .replace(/[""]/g, '"') // Normalize double quotes
+                  .replace(/&;/g, '') // Remove HTML entities
+                  .replace(/<[^>]*>/g, '') // Remove HTML tags
+                  .replace(/[^\x20-\x7E\n]/g, '') // Remove non-printable characters
+                  .replace(/\n{3,}/g, '\n\n') // Normalize multiple newlines
+                  .replace(/\s*>\s*/g, '') // Remove standalone > characters
+                  .trim(), {
+                  breaks: true,
+                  gfm: true
+                }) }}
+              />
+            </div>
+          )
+        }));
+        setSuccessMessage('Strategy document updated successfully');
+      } else {
+        setErrorMessage('Please select a Strategy document');
+      }
+    } catch (error) {
+      console.error('Error loading file content:', error);
+      setErrorMessage('Failed to load file content');
+    }
+  };
+
+  // Function to handle opening the file manager
+  const handleOpenFileManager = () => {
+    setModalRefreshKey(prevKey => prevKey + 1); // Increment the key to force refresh
+    logFileSystemState(); // Log file system state for debugging
+    setShowFileManagerModal(true);
+  };
+
+  // Function to handle opening the settings modal
+  const handleOpenSettings = () => {
+    setModalRefreshKey(prevKey => prevKey + 1); // Increment the key to force refresh
+    logFileSystemState(); // Log file system state for debugging
+    setShowSettingsModal(true);
+  };
+
+  // Remove the checkFilesInDirectory function and its usage
+  const handleDirectoryChange = async (newDirectory: string) => {
+    setStorageDirectory(newDirectory);
+    localStorage.setItem('neoStorageDirectory', newDirectory);
+  };
+
+  // Remove the implementSuggestion function and its usage
+  const handleSuggestionClick = (suggestionId: string) => {
+    // Handle suggestion click without implementing changes
+    console.log('Suggestion clicked:', suggestionId);
+  };
+
+  // Add handler for warning clicks
+  const handleWarningClick = async (docType: DocumentType, inconsistency: Inconsistency) => {
+    // Switch to the document related to the warning
+    setActiveDocument(docType);
+    
+    setSelectedWarning({ docType, inconsistency });
+    
+    const prompt = `I've identified an inconsistency in your ${docType} document that needs attention:
+
+Location: ${inconsistency.implementationDetails.section}
+Issue: ${inconsistency.text}
+Recommended Action: ${inconsistency.implementationDetails.action}
+
+I'll provide a detailed suggestion to resolve this issue:
+1. What exactly needs to change
+2. How it should be changed
+3. Why this change is important
+4. The expected impact of this change
+
+Please analyze this issue and provide specific, actionable steps to resolve it.`;
+    
+    setClaudePrompt(prompt);
+    setPromptStage('pending');
+    
+    try {
+      const response: ClaudeResponse = {
+        id: Date.now(),
+        response: `I've analyzed the inconsistency in your ${docType} document and here's my detailed suggestion:
+
+Issue Location: ${inconsistency.implementationDetails.section}
+
+Current Issue:
+${inconsistency.text}
+
+Recommended Fix:
+${inconsistency.implementationDetails.action}
+
+Implementation Steps:
+1. Navigate to the ${inconsistency.implementationDetails.section} section
+2. Review the current content
+3. Apply the suggested changes
+4. Verify the consistency with other sections
+
+Would you like me to help you implement these changes?`,
+        suggestion: {
+          id: `suggestion-${Date.now()}`,
+          text: inconsistency.text,
+        implementationDetails: {
+            section: inconsistency.implementationDetails.section,
+            action: inconsistency.implementationDetails.action
+          }
+        }
+      };
+      
+      setClaudeResponses(prev => [...prev, response]);
+      setPromptStage('completed');
+    } catch (error) {
+      setError('Failed to generate suggestion');
+      setPromptStage('idle');
+    }
+  };
+
+  // Remove the improvementSuggestions object and its usage
+  const renderSuggestions = () => {
+    return null; // Or implement a different suggestion rendering logic
+  };
+
+  // Add the function to generate improvement suggestions
+  const generateImprovementSuggestion = async (documentType: DocumentType) => {
+    const prompt = `Please analyze the current ${documentType} document and suggest improvements:
+1. Review the content structure
+2. Check for clarity and completeness
+3. Identify potential enhancements
+4. Consider best practices for ${documentType.toLowerCase()} documents
+
+Please provide specific, actionable suggestions for improving this document.`;
+    
+    setClaudePrompt(prompt);
+    setPromptStage('pending');
+    
+    try {
+      const response: ClaudeResponse = {
+        id: Date.now(),
+        response: `I've analyzed your ${documentType} and here's my suggestion for improvement:`,
+        suggestion: {
+          id: `improvement-${Date.now()}`,
+          text: `Consider enhancing the ${documentType} by improving its structure and content`,
+        implementationDetails: {
+            section: documentType,
+            action: 'Enhance document structure and content'
+          }
+        }
+      };
+      
+      setClaudeResponses(prev => [...prev, response]);
+      setPromptStage('completed');
+    } catch (error) {
+      setError('Failed to generate improvement suggestion');
+      setPromptStage('idle');
+    }
+  };
+
+  // Add an interval to periodically check for potential improvements
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (activeDocument) {
+        generateImprovementSuggestion(activeDocument);
+      }
+    }, 300000); // Check every 5 minutes
+
+    return () => clearInterval(interval);
+  }, [activeDocument]);
+
   // Render the component
   if (!isClient) {
     return <div>Loading...</div>;
@@ -1518,297 +2655,292 @@ Please start by sharing your goals and vision.`
   return (
     <div className="flex flex-col h-screen bg-gray-100">
       {/* Top Bar */}
-      {user && (
+    {user && (
         <div className="w-full bg-blue-600 text-white p-2 flex justify-between items-center z-10">
-          <div className="flex items-center">
-            <span className="font-medium ml-2">
-              {user.email} | Project: {projectId !== 'default-project' ? 
-                projectList.find(p => p.id === projectId)?.name || projectId : 'No Project Selected'}
-            </span>
-          </div>
-          <div className="flex items-center">
-            {lastSyncedAt && (
-              <span className="text-sm mr-4">
-                Last synced: {lastSyncedAt.toLocaleTimeString()}
-              </span>
-            )}
-            <button 
-              className="text-white hover:text-gray-200 text-sm"
-              onClick={logoutUser}
-            >
-              Sign Out
-            </button>
-          </div>
+        <div className="flex items-center">
+          <span className="font-medium ml-2">
+            {user.email} | Project: {projectId !== 'default-project' ? 
+              projectList.find(p => p.id === projectId)?.name || projectId : 'No Project Selected'}
+          </span>
         </div>
-      )}
-
+        <div className="flex items-center">
+          {lastSyncedAt && (
+            <span className="text-sm mr-4">
+              Last synced: {lastSyncedAt.toLocaleTimeString()}
+            </span>
+          )}
+            <button 
+              className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 mr-2"
+              onClick={handleOpenFileManager}
+            >
+              Choose File
+            </button>
+          <button 
+            className="text-white hover:text-gray-200 text-sm"
+            onClick={logoutUser}
+          >
+            Sign Out
+          </button>
+        </div>
+      </div>
+    )}
+    
       {/* Main Content Area */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left Sidebar */}
-        <div className="w-64 bg-gray-200 p-4 overflow-y-auto flex flex-col">
-          <h2 className="text-xl font-bold mb-4">Project Files</h2>
+      {/* Left Sidebar */}
+        <div className="w-64 bg-gray-200 flex flex-col h-full">
+          <div className="flex-1 p-4 overflow-y-auto">
+        <h2 className="text-xl font-bold mb-4">Project Files</h2>
           
-          {/* Add the new Guided Strategy button at the top */}
           <button 
-            className="w-full bg-yellow-500 hover:bg-yellow-600 text-white p-2 rounded mb-4 flex items-center justify-center gap-2 transition-colors"
-            onClick={startAIGuidedStrategy}
+              className="w-full bg-yellow-500 hover:bg-yellow-600 text-white p-2 rounded mb-4 flex items-center justify-center gap-2 transition-colors"
+              onClick={startAIGuidedStrategy}
           >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z" clipRule="evenodd" />
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z" clipRule="evenodd" />
             </svg>
-            Create New Strategy
+              Create New Strategy
           </button>
           
-          <div className="space-y-2 mb-8">
-            {['Canvas', 'Strategy', 'Financial Projection', 'OKRs'].map((doc) => (
-              <div 
-                key={doc} 
-                className={`p-2 rounded cursor-pointer flex justify-between items-center ${activeDocument === doc ? 'bg-blue-100 font-semibold' : 'bg-gray-300 hover:bg-gray-400'}`}
-                onClick={() => setActiveDocument(doc as DocumentType)}
+            {/* Document buttons */}
+            {Object.keys(documentAssignments).map((docType) => (
+          <button 
+                key={docType}
+                className={`w-full p-2 rounded mb-2 flex items-center justify-between ${
+                  activeDocument === docType ? 'bg-blue-600 text-white' : 'bg-white hover:bg-gray-100'
+                }`}
+                onClick={() => setActiveDocument(docType as DocumentType)}
               >
-                <span>{doc}</span>
-                {inconsistencyCount[doc as DocumentType] > 0 ? (
-                  <span className="bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs">
-                    {inconsistencyCount[doc as DocumentType]}
-                  </span>
-                ) : (
-                  <span className="bg-green-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs">
-                    0
+                {docType}
+                {inconsistencies[docType as DocumentType]?.length > 0 && (
+                  <span className="bg-red-500 text-white text-xs px-2 py-1 rounded-full">
+                    {inconsistencies[docType as DocumentType]?.length}
                   </span>
                 )}
-              </div>
+          </button>
             ))}
-          </div>
-          <div className="mt-auto space-y-2">
+
+            {/* Warnings section */}
+            <div className="mt-4 bg-white p-4 rounded shadow">
+              <h3 className="font-bold text-lg mb-2">Warnings</h3>
+              {Object.entries(inconsistencies).map(([docType, docInconsistencies]) => 
+                docInconsistencies.map((inconsistency: Inconsistency) => (
+                  <div
+                    key={inconsistency.id}
+                    className="mb-2 p-2 bg-red-50 rounded cursor-pointer hover:bg-red-100 transition-colors"
+                    onClick={() => handleWarningClick(docType as DocumentType, inconsistency)}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium">{docType}</span>
+                      <span className="text-sm text-red-600">{inconsistency.implementationDetails.section}</span>
+                    </div>
+                    <p className="text-sm text-gray-600 mt-1">{inconsistency.text}</p>
+                    <p className="text-xs text-red-600 mt-1">
+                      Action needed: {inconsistency.implementationDetails.action}
+                    </p>
+                  </div>
+                ))
+              )}
+              {Object.keys(inconsistencies).every(key => !inconsistencies[key as DocumentType]?.length) && (
+                <p className="text-gray-500 text-sm">No warnings found</p>
+              )}
+            </div>
+
+            {/* Fixed bottom buttons */}
+            <div className="p-4 border-t border-gray-300 bg-gray-200">
             <button 
-              className="w-full bg-blue-500 text-white p-2 rounded flex items-center justify-center"
-              onClick={() => setShowIntegrationModal(true)}
+                className="w-full bg-green-500 hover:bg-green-600 text-white p-2 rounded mb-2 flex items-center justify-center transition-colors"
+                onClick={handleOpenFileManager}
             >
-              Import/Export
+                File Manager
             </button>
-            <button 
-              className="w-full bg-green-500 text-white p-2 rounded flex items-center justify-center"
-              onClick={() => setShowFileManagerModal(true)}
-            >
-              File Manager
-            </button>
-            <button 
-              className="w-full bg-purple-500 text-white p-2 rounded flex items-center justify-center"
-              onClick={() => setShowSettingsModal(true)}
-            >
-              Settings
-            </button>
-          </div>
+              <button 
+                className="w-full bg-purple-500 hover:bg-purple-600 text-white p-2 rounded flex items-center justify-center transition-colors"
+                onClick={handleOpenSettings}
+              >
+                Settings
+              </button>
+            </div>
         </div>
+      </div>
 
         {/* Center Content */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Document Display */}
-          <div className={`flex-1 bg-white m-4 mb-2 rounded shadow overflow-auto ${isSyncing ? 'opacity-50' : ''}`}>
-            {isSyncing && (
-              <div className="absolute inset-0 flex items-center justify-center z-10">
-                <div className="bg-white p-4 rounded-lg shadow-lg">
-                  <div className="flex items-center">
-                    <svg className="animate-spin h-8 w-8 text-blue-500 mr-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                    <span className="text-gray-700 font-medium">Syncing with database...</span>
-                  </div>
+        {/* Document Display */}
+        <div className={`flex-1 bg-white m-4 mb-2 rounded shadow overflow-auto ${isSyncing ? 'opacity-50' : ''}`}>
+          {isSyncing && (
+            <div className="absolute inset-0 flex items-center justify-center z-10">
+              <div className="bg-white p-4 rounded-lg shadow-lg">
+                <div className="flex items-center">
+                  <svg className="animate-spin h-8 w-8 text-blue-500 mr-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  <span className="text-gray-700 font-medium">Syncing with database...</span>
                 </div>
               </div>
-            )}
-            {documentContent[activeDocument as DocumentType]}
-          </div>
-
-          {/* Chat Responses */}
-          <div className="chat-responses max-h-48 overflow-y-auto bg-white m-4 mt-0 mb-2 rounded shadow p-4">
-            {claudeResponses.map((response) => (
-              <div key={response.id} className="mb-3 last:mb-0">
-                <div className="bg-blue-50 p-3 rounded">
-                  <p className="text-gray-800 whitespace-pre-wrap">{response.response}</p>
-                  {response.suggestion && (
-                    <div className="mt-3 flex gap-2">
-                      <button
-                        onClick={() => implementSuggestion(response.suggestion!)}
-                        className="px-3 py-1 bg-green-500 text-white rounded hover:bg-green-600 flex items-center gap-1"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                          <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                        </svg>
-                        Accept
-                      </button>
-                      <button
-                        onClick={() => {
-                          // Add to implemented suggestions to hide it
-                          setImplementedSuggestions(prev => [...prev, response.suggestion!.id]);
-                          // Add rejection response
-                          setClaudeResponses(prev => [...prev, {
-                            id: prev.length + 1,
-                            response: "I understand. Let me know if you'd like to explore other ways to improve the document's consistency."
-                          }]);
-                        }}
-                        className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600 flex items-center gap-1"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                          <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
-                        </svg>
-                        Reject
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Chat Input */}
-          <div className="p-4 pt-0 bg-white m-4 mt-0 rounded shadow">
-            <form onSubmit={handleSubmit} className="flex">
-              <input
-                type="text"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                placeholder={guidedStrategyState.active ? `Tell me about step ${guidedStrategyState.step}...` : "Ask Claude about your strategy..."}
-                className="flex-1 p-2 border rounded-l focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <button 
-                type="submit" 
-                className="bg-blue-500 text-white px-6 rounded-r hover:bg-blue-600 transition-colors"
-              >
-                Send
-              </button>
-            </form>
-          </div>
-        </div>
-
-        {/* Right Sidebar */}
-        <div className="w-64 bg-gray-200 p-4 overflow-y-auto">
-          {successMessage && (
-            <div className="mb-3 p-2 bg-green-100 text-green-800 rounded">
-              ✓ {successMessage}
             </div>
           )}
-          
-          {/* Systemic Issues Block */}
-          <h3 className="font-bold mb-2">Systemic Analysis</h3>
-          <div className="bg-white p-3 rounded mb-4">
-            {systemicIssues[activeDocument]?.length > 0 ? (
-              <ul className="space-y-3">
-                {systemicIssues[activeDocument]?.map(issue => (
-                  <li 
-                    key={issue.id} 
-                    className={`${implementedSuggestions.includes(issue.id) ? 'opacity-50' : ''}`}
-                  >
-                    <div 
-                      className={`cursor-pointer rounded-lg border p-2 hover:border-blue-500 transition-colors
-                        ${issue.type === 'trap' ? 'border-red-200 bg-red-50' :
-                          issue.type === 'opportunity' ? 'border-green-200 bg-green-50' :
-                          issue.type === 'feedback_loop' ? 'border-blue-200 bg-blue-50' :
-                          issue.type === 'delay' ? 'border-yellow-200 bg-yellow-50' :
-                          issue.type === 'hierarchy' ? 'border-purple-200 bg-purple-50' :
-                          'border-gray-200 bg-gray-50'}`}
-                      onClick={() => {
-                        if (!implementedSuggestions.includes(issue.id)) {
-                          const systemicResponse = {
-                            id: claudeResponses.length + 1,
-                            response: `From a systems thinking perspective (channeling Donella Meadows):\n\n"${issue.systemsPerspective}"\n\nI've identified a systemic ${issue.type} in your strategy:\n${issue.description}\n\nTo address this, I suggest:\n- Document to modify: ${issue.suggestedAction.document}\n- Action: ${issue.suggestedAction.action}\n- Rationale: ${issue.suggestedAction.explanation}\n\nWould you like me to implement this systems-informed change to strengthen your strategy?`
-                          };
-                          setClaudeResponses(prev => {
-                            const newResponses = [...prev, systemicResponse];
-                            scrollToBottom();
-                            return newResponses;
-                          });
+            <div className="text-left">
+              {documentContent[activeDocument as DocumentType]}
+        </div>
+                </div>
+        </div>
+        
+      {/* Right Sidebar */}
+        <div className="w-80 bg-gray-100 flex flex-col h-full">
+          {/* Scrollable content area */}
+          <div className="flex-1 p-4 overflow-y-auto">
+            {/* Systemic Issues */}
+            <div className="mb-6">
+              <h3 className="text-lg font-semibold mb-3">Systemic Issues</h3>
+              <div className="bg-white rounded-lg shadow">
+                {systemicIssues[activeDocument]?.length > 0 ? (
+                  systemicIssues[activeDocument].map(issue => (
+                    <div
+                      key={issue.id}
+                      className={`p-3 border-b last:border-b-0 cursor-pointer hover:bg-gray-50 ${
+                        issue.type === 'trap' ? 'border-l-4 border-l-red-500' :
+                        issue.type === 'opportunity' ? 'border-l-4 border-l-green-500' :
+                        issue.type === 'feedback_loop' ? 'border-l-4 border-l-blue-500' :
+                        issue.type === 'delay' ? 'border-l-4 border-l-yellow-500' :
+                        'border-l-4 border-l-purple-500'
+                      }`}
+                      onClick={() => handleWarningClick(activeDocument, {
+                        id: issue.id,
+                        text: issue.description,
+                        implementationDetails: {
+                          section: issue.suggestedAction.document,
+                          action: issue.suggestedAction.action
                         }
-                      }}
+                      })}
                     >
-                      <div className="flex items-start justify-between">
-                        <span className={`text-xs px-2 py-1 rounded-full
-                          ${issue.type === 'trap' ? 'bg-red-200 text-red-800' :
-                            issue.type === 'opportunity' ? 'bg-green-200 text-green-800' :
-                            issue.type === 'feedback_loop' ? 'bg-blue-200 text-blue-800' :
-                            issue.type === 'delay' ? 'bg-yellow-200 text-yellow-800' :
-                            issue.type === 'hierarchy' ? 'bg-purple-200 text-purple-800' :
-                            'bg-gray-200 text-gray-800'}`}>
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-sm font-medium">{issue.title}</span>
+                        <span className={`text-xs px-2 py-1 rounded-full ${
+                          issue.type === 'trap' ? 'bg-red-100 text-red-800' :
+                          issue.type === 'opportunity' ? 'bg-green-100 text-green-800' :
+                          issue.type === 'feedback_loop' ? 'bg-blue-100 text-blue-800' :
+                          issue.type === 'delay' ? 'bg-yellow-100 text-yellow-800' :
+                          'bg-purple-100 text-purple-800'
+                        }`}>
                           {issue.type.replace('_', ' ')}
                         </span>
-                      </div>
-                      <h4 className="font-medium mt-2">{issue.title}</h4>
-                      <p className="text-sm text-gray-600 mt-1">{issue.description}</p>
-                      {!implementedSuggestions.includes(issue.id) && (
-                        <p className="text-xs text-blue-600 mt-2 flex items-center">
-                          <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 9l3 3m0 0l-3 3m3-3H8m13 0a9 9 0 11-18 0 9 9 0 0118 0z" />
-                          </svg>
-                          View systems perspective
-                        </p>
-                      )}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-gray-500 text-sm italic">No systemic issues detected in current document</p>
-            )}
-          </div>
-          
-          {/* Existing Inconsistencies Block */}
-          <h3 className="font-bold mb-2">Document Inconsistencies</h3>
-          <div className="bg-white p-3 rounded mb-4">
-            {inconsistencies[activeDocument]?.length > 0 ? (
-              <ul className="list-disc pl-5">
-                {inconsistencies[activeDocument]?.map(inconsistency => (
-                  <li 
-                    key={inconsistency.id} 
-                    className={`mb-2 ${implementedSuggestions.includes(inconsistency.id) ? 'text-gray-400 line-through' : 'cursor-pointer hover:text-blue-600'}`}
-                    onClick={() => {
-                      if (!implementedSuggestions.includes(inconsistency.id)) {
-                        // Add Claude response suggesting the fix
-                        const suggestionResponse = {
-                          id: claudeResponses.length + 1,
-                          response: `I've detected an inconsistency: ${inconsistency.text}\n\nI suggest implementing the following change to resolve this:\n- Document to modify: ${inconsistency.implementationDetails.section}\n- Proposed action: ${inconsistency.implementationDetails.action}\n\nWould you like me to implement this change to maintain consistency across your documents?`,
-                          suggestion: inconsistency
-                        };
-                        setClaudeResponses(prev => {
-                          const newResponses = [...prev, suggestionResponse];
-                          scrollToBottom();
-                          return newResponses;
-                        });
-                      }
-                    }}
-                  >
-                    <div className="group">
-                      <p className={implementedSuggestions.includes(inconsistency.id) ? 'line-through' : 'font-medium'}>
-                        {inconsistency.text}
+                </div>
+                      <p className="text-sm text-gray-600">{issue.description}</p>
+              </div>
+                  ))
+                ) : (
+                  <p className="p-3 text-sm text-gray-500">No systemic issues detected</p>
+                )}
+              </div>
+            </div>
+
+            {/* Improvement Suggestions */}
+            <div className="mb-6">
+              <h3 className="text-lg font-semibold mb-3">Improvement Suggestions</h3>
+              <div className="bg-white rounded-lg shadow">
+                {claudeResponses
+                  .filter(response => response.suggestion && !response.suggestion.text.includes('inconsistency'))
+                  .map(response => (
+                    <div
+                      key={response.suggestion!.id}
+                      className={`p-3 border-b last:border-b-0 ${
+                        implementedSuggestions.includes(response.suggestion!.id)
+                          ? 'bg-green-50'
+                          : 'hover:bg-gray-50'
+                      }`}
+                    >
+                      <p className="text-sm mb-2">{response.suggestion!.text}</p>
+                      <p className="text-xs text-gray-600 mb-2">
+                        Section: {response.suggestion!.implementationDetails.section}
                       </p>
-                      {!implementedSuggestions.includes(inconsistency.id) && (
-                        <p className="text-sm text-gray-500 mt-1 group-hover:text-blue-500">
-                          Click to see suggestion →
-                        </p>
+                      {!implementedSuggestions.includes(response.suggestion!.id) && (
+                        <div className="flex justify-end gap-2">
+                          <button
+                            onClick={() => handleSuggestionClick(response.suggestion!.id)}
+                            className="px-3 py-1 text-sm bg-blue-500 text-white rounded hover:bg-blue-600"
+                          >
+                            Accept
+                          </button>
+                          <button
+                            onClick={() => setImplementedSuggestions(prev => [...prev, response.suggestion!.id])}
+                            className="px-3 py-1 text-sm bg-gray-500 text-white rounded hover:bg-gray-600"
+                          >
+                            Reject
+                          </button>
+            </div>
                       )}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-gray-500 text-sm italic">No inconsistencies detected in current document</p>
-            )}
           </div>
-          
-          {/* Existing Improvement Suggestions Block */}
-          <h3 className="font-bold mb-2">Improvement Suggestions</h3>
-          <div className="bg-white p-3 rounded mb-4">
-            <ul className="list-disc pl-5">
-              {improvementSuggestions[activeDocument]?.map(suggestion => (
-                <li 
-                  key={suggestion.id} 
-                  className={`mb-2 ${implementedSuggestions.includes(suggestion.id) ? 'text-gray-400 line-through' : 'cursor-pointer hover:text-blue-600'}`}
-                  onClick={() => !implementedSuggestions.includes(suggestion.id) && implementSuggestion(suggestion)}
-                >
-                  {suggestion.text}
-                </li>
+                  ))}
+                {claudeResponses.filter(response => response.suggestion && !response.suggestion.text.includes('inconsistency')).length === 0 && (
+                  <p className="p-3 text-sm text-gray-500">No improvement suggestions yet</p>
+                )}
+              </div>
+            </div>
+
+            {/* Document Inconsistencies */}
+            <div className="mb-6">
+              <h3 className="text-lg font-semibold mb-3">Document Inconsistencies</h3>
+              <div className="bg-white rounded-lg shadow">
+                {inconsistencies[activeDocument]?.length > 0 ? (
+                  inconsistencies[activeDocument].map((inconsistency: Inconsistency) => (
+                    <div
+                key={inconsistency.id} 
+                      className="p-3 border-b last:border-b-0 cursor-pointer hover:bg-gray-50"
+                      onClick={() => handleWarningClick(activeDocument, inconsistency)}
+                    >
+                      <p className="text-sm">{inconsistency.text}</p>
+                      <p className="text-xs text-red-600 mt-1">
+                        {inconsistency.implementationDetails.section} → {inconsistency.implementationDetails.action}
+                      </p>
+          </div>
+                  ))
+                ) : (
+                  <p className="p-3 text-sm text-gray-500">No inconsistencies found</p>
+                )}
+              </div>
+          </div>
+        </div>
+        
+          {/* Fixed AI Response Window at bottom */}
+          <div className="border-t border-gray-200 bg-white">
+            <div className="p-3 bg-gray-50 border-b border-gray-200">
+              <h3 className="font-semibold">AI Response</h3>
+          </div>
+            <div className="h-64 overflow-y-auto p-3">
+              {claudeResponses.map(response => (
+                <div key={response.id} className="mb-3 last:mb-0 text-left">
+                  <p className="text-sm whitespace-pre-wrap">{response.response}</p>
+                </div>
               ))}
-            </ul>
+              {promptStage === 'pending' && (
+                <div className="flex items-center justify-center p-4">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+                </div>
+              )}
+              {claudeResponses.length === 0 && promptStage !== 'pending' && (
+                <p className="text-sm text-gray-500 text-left">Click on an item above to get AI assistance</p>
+              )}
+            </div>
+            {/* Chat input area */}
+            <div className="p-3 border-t border-gray-200">
+              <div className="flex gap-2">
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Ask for clarification..."
+                  className="flex-1 px-3 py-2 border rounded text-sm"
+            />
+            <button 
+                  onClick={() => {/* Handle chat submit */}}
+                  className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+            >
+              Send
+            </button>
+        </div>
+      </div>
           </div>
         </div>
       </div>
@@ -1816,37 +2948,47 @@ Please start by sharing your goals and vision.`
       {/* Modals */}
       {showIntegrationModal && (
         <IntegrationModal 
-          activeTab={activeTab}
-          setActiveTab={setActiveTab}
           onClose={() => setShowIntegrationModal(false)}
-          storageDirectory={storageDirectory}
           onShowSettings={() => {
             setShowIntegrationModal(false);
-            setShowSettingsModal(true);
+            handleOpenSettings();
           }}
-          onFileSelect={handleFileSelect}
-          onFileDrop={handleFileDrop}
+          storageDirectory={storageDirectory}
         />
       )}
       
       {showSettingsModal && (
         <SettingsModal 
+          key={`settings-modal-${modalRefreshKey}`}
           storageDirectory={storageDirectory}
           onSave={handleSaveSettings}
           onClose={() => setShowSettingsModal(false)}
-          fileCount={isClient ? Object.keys(JSON.parse(localStorage.getItem('neoFileSystem') || '{}')).length : 0}
+          fileCount={isClient ? Object.keys(JSON.parse(localStorage.getItem('neoFileSystem') || '{}'))
+            .filter(path => {
+              const cleanPath = path.replace(/^\/+|\/+$/g, '');
+              const cleanStorageDir = storageDirectory ? storageDirectory.replace(/^\/+|\/+$/g, '') : '';
+              
+              if (!cleanStorageDir) {
+                return !cleanPath.includes('/');
+              }
+              
+              return cleanPath.startsWith(cleanStorageDir + '/') && 
+                !cleanPath.slice(cleanStorageDir.length + 1).includes('/');
+            }).length : 0}
         />
       )}
       
       {showFileManagerModal && (
         <FileManagerModal 
+          isOpen={showFileManagerModal}
+          onFileSelect={handleFileSelect}
           storageDirectory={storageDirectory}
           isClient={isClient}
           onClose={() => setShowFileManagerModal(false)}
           onFileAction={(message) => {
             setSuccessMessage(message);
-            setTimeout(() => setSuccessMessage(null), 3000);
           }}
+          onDirectoryChange={handleDirectoryChange}
         />
       )}
       
@@ -1861,6 +3003,15 @@ Please start by sharing your goals and vision.`
           onClose={() => setShowLoginModal(false)}
         />
       )}
+      
+      <FileSetupModal
+        isOpen={showFileSetup}
+        onClose={() => {
+          console.log('File setup modal closed');
+          setShowFileSetup(false);
+        }}
+        onSetupComplete={handleFileSetupComplete}
+      />
     </div>
   );
 };

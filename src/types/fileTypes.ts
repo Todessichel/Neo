@@ -1,5 +1,7 @@
 // src/types/fileTypes.ts
 
+import { DocumentType } from './projectTypes';
+
 // Define possible content shapes based on file formats
 export interface CsvContent {
   format: 'csv';
@@ -39,6 +41,7 @@ export interface TextContent {
 export interface FileSystemEntry {
   content: FileContent;
   lastModified: string;
+  docType?: DocumentType;
   [key: string]: any; // For any additional properties
 }
 
@@ -48,7 +51,16 @@ export type FileContent = CsvContent | ExcelContent | WordContent | JsonContent 
 
 // FileData interface that uses the FileContent type
 export interface FileData {
-  path: string;
-  content: FileContent;
-  lastModified: string;
+  fullPath: string;  // Full path including directory
+  path: string;      // Display path without directory prefix
+  content?: FileContent; // Make content optional since we don't need it for file listing
+  lastModified: string | Date; // Allow Date object as well
+  docType?: DocumentType;
+}
+
+export interface FileLocation {
+  directory: string;
+  files: {
+    [key in DocumentType]?: string;
+  };
 }

@@ -1,3 +1,12 @@
+export type DocumentType = 'Strategy' | 'OKRs' | 'Financial Projection' | 'Canvas';
+
+export interface Document {
+  id: string;
+  title: string;
+  content: any;
+  lastModified: Date;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -7,16 +16,6 @@ export interface Project {
   ownerId: string;
   collaborators?: string[];
   documents: {
-    canvas?: DocumentData;
-    strategy?: DocumentData;
-    financialProjection?: DocumentData;
-    okrs?: DocumentData;
+    [key in DocumentType]?: Document;
   };
-}
-
-export interface DocumentData {
-  content: string;
-  lastModified: Date;
-  version: number;
-  modifiedBy: string;
 } 
